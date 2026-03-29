@@ -1,0 +1,584 @@
+# From Single Iteration to Full Pipeline {#sec-pipeline}
+
+```{r}
+#| label: setup-pipeline
+#| include: false
+source("_common.R")
+```
+
+```{r}
+#| label: source-functions
+#| include: false
+source("R/simulation-functions.R")
+```
+
+The previous chapters built the two core components of the simulation: `generate_meta()` produces a synthetic meta-analytic dataset from known parameters (@sec-generate-meta), and `estimate_models()` fits the three working models and extracts coefficient-level results (@sec-estimation). Each component works on a single dataset. But a Monte Carlo simulation requires **thousands** of datasets, and we need a systematic way to assess how well estimation procedures perform across those repetitions.
+
+This chapter covers the orchestration layer --- the functions that combine generation and estimation into a single iteration, repeat that iteration many times, and summarize the results into performance metrics. In the ADEMP framework, we are now squarely in the **Performance** component. In the DSR workflow of @miratrixpustejovsky2024, we are covering Steps 3 (Repeat) and 4 (Summarize).
+
+The pipeline consists of three functions, each building on the last:
+
+1. `generate_estimate()` --- runs one iteration (sample studies, generate data, fit models),
+2. `assess_performance()` --- computes bias, RMSE, coverage, and other metrics across all iterations,
+3. `simulate_meta()` --- orchestrates the full loop: repeat `generate_estimate()` $R$ times, then call `assess_performance()`.
+
+@fig-pipeline illustrates this pipeline as a flowchart, showing how a single iteration cycles from study sampling through estimation, and how the full loop feeds into performance assessment.
+
+```{mermaid}
+%%| label: fig-pipeline
+%%| fig-cap: "The simulation pipeline: from study sampling through performance assessment."
+%%| fig-width: 7
+flowchart TD
+  Sample["Sample <i>J</i> studies<br/>from TSL15 pool"] --> Valid{"Full rank?<br/>Min 4 studies<br/>per category?"}
+  Valid -- "No" --> Sample
+  Valid -- "Yes" --> Gen["generate_meta()<br/>Produce effect sizes"]
+  Gen --> Est["estimate_models()<br/>Fit CE, CHE, SCE"]
+  Est --> Collect["Stack results"]
+  Collect --> Loop{"<i>R</i> = 4,012<br/>done?"}
+  Loop -- "No" --> Sample
+  Loop -- "Yes" --> Perf["assess_performance()<br/>Bias, RMSE, coverage"]
+
+  style Sample fill:#4e79a7,color:#fff,stroke:#2d5f8a
+  style Gen fill:#59a14f,color:#fff,stroke:#3d7a35
+  style Est fill:#e15759,color:#fff,stroke:#b5393b
+  style Perf fill:#76b7b2,color:#fff,stroke:#4d918c
+  style Collect fill:#eee,stroke:#999
+  style Valid fill:#fff,stroke:#333,stroke-width:2px
+  style Loop fill:#fff,stroke:#333,stroke-width:2px
+```
+
+
+## The single-iteration function: `generate_estimate()` {#sec-generate-estimate}
+
+The `generate_estimate()` function is the workhorse that executes a single Monte Carlo iteration. It takes in the full empirical covariate structure, samples a subset of studies, generates synthetic effect sizes via `generate_meta()`, and fits all working models via `estimate_models()`. Crucially, it also performs **rejection sampling** to ensure the sampled design is estimable.
+
+Why is rejection sampling necessary? When we randomly draw `n_studies` from the empirical pool, the resulting design matrix may not support estimation. Two things can go wrong:
+
+- The covariate matrix $\mathbf{X}$ for the sampled studies may be rank-deficient (e.g., a categorical level is entirely absent from the sample).
+- A subgroup category may have fewer than `min_studies` studies, making the SCE variance component for that subgroup inestimable.
+
+The function addresses both issues with a `while` loop that keeps resampling until a valid configuration is found.
+
+```{r}
+#| label: generate-estimate-code
+#| eval: false
+#| code-fold: true
+#| code-summary: "Show full generate_estimate() code"
+
+generate_estimate <- function(
+    iteration,                                         # <1>
+    n_studies,
+    tau, omega, rho, nu,
+    covariates, studyID,
+    subgroup,
+    sample_sizes,
+    beta,
+    tau_covariate, tau_corr, tau_scalar,
+    formula_string, mods, r_imputed,
+    min_studies, max_effects = Inf) {
+
+  isPD_subtb <- FALSE                                  # <2>
+
+  while (!isPD_subtb) {                                # <3>
+    # draw sample of studies
+    studyID_sample <- sample(                          # <4>
+      levels(studyID),
+      size = n_studies, replace = FALSE
+    )
+
+    # sample effect sizes from each study
+    es_sample <- tapply(                               # <5>
+      1:length(studyID), studyID,
+      function(x) x %in%
+        if (length(x) <= max_effects) x
+        else sample(x, size = max_effects)
+    )
+    es_sample <- unsplit(es_sample, studyID)
+
+    # calculate indices of included studies and effect sizes
+    sample_indices <- (studyID %in% studyID_sample) & es_sample
+
+    sub_tb <- rowSums(                                 # <6>
+      table(subgroup[sample_indices],
+            studyID[sample_indices]) > 0
+    )
+    isPD <- qr(                                        # <7>
+      covariates[sample_indices, ]
+    )$rank == ncol(covariates)
+    isPD_subtb <- isPD & all(sub_tb >= min_studies)    # <8>
+  }
+
+  dat <- generate_meta(                                # <9>
+    covariates = covariates[sample_indices, ],
+    studyID = droplevels(studyID[sample_indices]),
+    subgroup = subgroup[sample_indices],
+    sample_sizes = sample_sizes[
+      levels(studyID) %in% studyID_sample
+    ],
+    beta = beta,
+    tau = tau, omega = omega, rho = rho, nu = nu,
+    tau_covariate = tau_covariate[sample_indices],
+    tau_corr = tau_corr, tau_scalar = tau_scalar
+  )
+
+  estimate_models(                                     # <10>
+    dat,
+    formula_string = formula_string,
+    r = r_imputed, smooth_vi = TRUE,
+    mods = mods
+  )
+}
+```
+1. `iteration` is the replication index (1 to $R$). It is required by `purrr::map_dfr()` but not used inside the function.
+2. Initialize the rejection-sampling flag to `FALSE`.
+3. Enter the `while` loop --- keep sampling until we find a valid design.
+4. Draw `n_studies` from the pool without replacement.
+5. If a study has more than `max_effects` effect sizes, subsample down to `max_effects`. This prevents a single study from dominating the dataset.
+6. Count the number of studies per subgroup level. The SCE model needs at least `min_studies` in every category.
+7. Check that the design matrix has full column rank via the QR decomposition.
+8. Both conditions must hold: full rank **and** sufficient studies per subgroup.
+9. Generate synthetic effect sizes using the valid sample.
+10. Fit all working models and return the combined results tibble.
+
+The rejection sampling is typically fast --- for most simulation conditions, a valid sample is found within a few draws. But for conditions with small `n_studies` and many subgroup levels, the loop may iterate many times. The authors do not cap the number of attempts, so in principle this could loop indefinitely, though in practice this does not occur with the empirical covariate structures used.
+
+::: {.callout-note}
+## Architectural note
+
+The `generate_estimate()` function bundles three conceptually distinct steps --- study sampling, data generation, and model estimation --- into a single call. This is pragmatic for parallelization (each call is self-contained), but it means the DGP and analysis are not cleanly separated. When we restructure with `simhelpers` in the next chapter, we will need to disentangle these steps.
+:::
+
+
+## The performance assessment function: `assess_performance()` {#sec-performance-metrics}
+
+Once all $R$ iterations have completed, their results are stacked into a single tibble with one row per (iteration $\times$ model $\times$ coefficient). The `assess_performance()` function takes this aggregated tibble, joins in the true parameter values, and computes the standard battery of Monte Carlo performance metrics.
+
+The function begins by constructing the ground truth. The true values for regression coefficients come directly from the `beta` vector. The true values for variance components are derived from `tau`, `omega`, and the `tau_scalar` vector (which allows heterogeneous between-study variance across subgroups):
+
+```{r}
+#| label: assess-performance-code
+#| eval: false
+#| code-fold: true
+#| code-summary: "Show full assess_performance() code"
+
+assess_performance <- function(
+    res, beta, tau, omega,
+    subgroup_levels, tau_scalar) {
+
+  true_beta <- tibble(                                 # <1>
+    coef = names(beta),
+    param = beta
+  )
+
+  true_varcomp <- tibble(                              # <2>
+    coef = c("tau2", "omega2",
+             paste("tau2", subgroup_levels, sep = "_")),
+    param = c(tau^2, omega^2,
+              tau^2 * rep(tau_scalar,
+                length.out = length(subgroup_levels))^2)
+  )
+
+  bind_rows(true_beta, true_varcomp) %>%
+    full_join(res, by = "coef") %>%                    # <3>
+    group_by(mod, coef) %>%
+    mutate(
+      err = est - param                                # <4>
+    ) %>%
+    summarise(
+      iterations = n(),                                # <5>
+      convergence = mean(cnvg),                        # <6>
+      bias = mean(err),                                # <7>
+      rmse = sqrt(mean(err^2)),                        # <8>
+      df_M = mean(df),                                 # <9>
+      df_SD = sd(df),
+      cover = mean(ci_lo < param & param < ci_hi),     # <10>
+      width = mean(ci_hi - ci_lo),                     # <11>
+      .groups = "drop"
+    )
+}
+```
+1. Construct a tibble of true regression coefficients from the `beta` vector (names carry the coefficient labels).
+2. Construct true variance component values. For the CS structure, `tau_scalar` is 1 for all subgroups; for the heterogeneous structure, it varies.
+3. Join true values to results by coefficient name, so every row now has both `est` and `param`.
+4. Compute the error (estimate minus truth) for every iteration.
+5. Count the number of iterations that produced results for this (model, coefficient) combination.
+6. Convergence rate: proportion of iterations where the model converged (`cnvg == TRUE`).
+7. Bias: mean error across iterations, $\text{Bias} = \frac{1}{R}\sum_{i=1}^{R}(\hat{\theta}_i - \theta)$.
+8. Root mean squared error: $\text{RMSE} = \sqrt{\frac{1}{R}\sum_{i=1}^{R}(\hat{\theta}_i - \theta)^2}$.
+9. Mean and standard deviation of Satterthwaite degrees of freedom across iterations.
+10. Coverage: proportion of iterations where the 95% CI contains the true parameter.
+11. Width: mean width of the 95% confidence intervals.
+
+The output is a tidy tibble with one row per (model, coefficient) combination, containing all performance metrics. This is what gets saved for each simulation condition and later used for visualization and tabulation.
+
+::: {.callout-important}
+## No Monte Carlo standard errors
+
+Notice what is **absent** from `assess_performance()`: there are no Monte Carlo standard errors (MCSEs). Every summary statistic --- bias, RMSE, coverage, width --- is a point estimate computed across $R$ replications, but the function does not quantify how much those estimates would vary if the simulation were re-run with a different random seed.
+
+As @morris2019 emphasize, reporting MCSEs is essential for responsible simulation practice. A coverage rate of 0.93 might be consistent with the nominal 0.95 if the MCSE is large enough, or it might represent a genuine shortfall. Without MCSEs, we cannot distinguish these cases.
+
+This is the gap that `simhelpers` will fill in the next chapter.
+:::
+
+
+## Connection to Mini Course 1 {#sec-connection-mini-course}
+
+The metrics computed by `assess_performance()` map directly onto the performance measures covered in Mini Course 1:
+
+| Metric | `assess_performance()` | Mini Course 1 | Reference |
+|:-------|:-----------------------|:--------------|:----------|
+| Bias | `mean(err)` | [Chapter 3](https://joonho112.github.io/simsum-mini-course/03-metrics-bias.html) | Absolute bias |
+| RMSE | `sqrt(mean(err^2))` | [Chapter 5](https://joonho112.github.io/simsum-mini-course/05-metrics-accuracy.html) | Accuracy and variability |
+| Coverage | `mean(ci_lo < param & param < ci_hi)` | [Chapter 6](https://joonho112.github.io/simsum-mini-course/06-metrics-inference.html) | Interval coverage |
+| MCSEs | *not computed* | [Chapter 7](https://joonho112.github.io/simsum-mini-course/07-mcse.html) | Monte Carlo uncertainty |
+
+: Mapping between `assess_performance()` and Mini Course 1 topics {#tbl-metric-mapping}
+
+Several observations are worth noting:
+
+- **Bias** here is the raw (absolute) bias, not relative bias. @pustejovsky2022 do not report relative bias, likely because some true parameter values are zero (making relative bias undefined).
+- **RMSE** combines both bias and variance into a single measure. When bias is small, RMSE is approximately equal to the empirical standard deviation of the estimates.
+- **Coverage** is computed for 95% confidence intervals. The nominal target is 0.95. Deviations below this threshold indicate that the interval procedure is anti-conservative for that model-coefficient combination.
+- **MCSEs** are not computed by @pustejovsky2022. This is a common omission in older simulation studies but is now considered a gap. The MCSE for coverage with 4,012 replications at the nominal level is approximately $\sqrt{0.95 \times 0.05 / 4012} \approx 0.003$, so departures of more than about 0.01 from 0.95 are likely meaningful. We will add MCSEs in the next chapter using `simhelpers`.
+- **Convergence rate** and **degrees of freedom** summaries are practical diagnostics not covered in Mini Course 1 but important for understanding model behavior in practice.
+
+
+## The `simulate_meta()` orchestrator {#sec-simulate-meta}
+
+The top-level function `simulate_meta()` ties everything together. It takes all simulation parameters for a single condition, runs the full loop, and returns the performance summary. This is the function that gets called once per row of the simulation design grid.
+
+```{r}
+#| label: simulate-meta-code
+#| eval: false
+#| code-fold: true
+#| code-summary: "Show full simulate_meta() code"
+
+simulate_meta <- function(
+    iterations,                                        # <1>
+    n_studies,
+    struct = "CS",
+    tau = 0, omega = 0, rho = 0.6, nu = 50,           # <2>
+    covariates, studyID,
+    subgroup = NULL,
+    sample_sizes = pmin(                               # <3>
+      20 + 2 * rpois(length(unique(studyID)), 20), 200
+    ),
+    beta = rep(0, ncol(covariates)),
+    tau_covariate = NULL, tau_corr = NULL, tau_scalar = 1,
+    mods = c("robu", "CHE", "SCE", "CMVE"),
+    r_imputed = 0.6,
+    min_studies = 3, max_effects = Inf,                  # <4>
+    seed = NULL) {
+
+  require(dplyr, quietly = TRUE,                       # <5>
+          warn.conflicts = FALSE)
+  require(tidyr, quietly = TRUE,
+          warn.conflicts = FALSE)
+  require(purrr, quietly = TRUE,
+          warn.conflicts = FALSE)
+  require(mvtnorm, quietly = TRUE,
+          warn.conflicts = FALSE)
+  suppressPackageStartupMessages(
+    require(metafor, quietly = TRUE,
+            warn.conflicts = FALSE)
+  )
+  require(clubSandwich, quietly = TRUE,
+          warn.conflicts = FALSE)
+
+  if (!is.null(seed)) set.seed(seed)                   # <6>
+
+  if (struct == "CS") {                                # <7>
+    tau_covariate <- NULL
+    tau_corr <- NULL
+    tau_scalar <- 1
+  }
+
+  studyID <- as.factor(studyID)
+  subgroup <- as.factor(subgroup)
+
+  formula_string <- paste(                             # <8>
+    colnames(covariates), collapse = " + "
+  )
+  formula_string <- paste("g ~ 0 +", formula_string)
+
+  res <- map_dfr(                                      # <9>
+    1:iterations,
+    .f = possibly(generate_estimate, otherwise = NULL),
+    n_studies = n_studies,
+    tau = tau, omega = omega, rho = rho, nu = nu,
+    covariates = covariates, studyID = studyID,
+    subgroup = subgroup,
+    sample_sizes = sample_sizes,
+    beta = beta,
+    tau_covariate = tau_covariate,
+    tau_corr = tau_corr, tau_scalar = tau_scalar,
+    formula_string = formula_string,
+    mods = mods,
+    r_imputed = r_imputed,
+    min_studies = min_studies,
+    max_effects = max_effects
+  )
+
+  assess_performance(                                  # <10>
+    res, beta = beta, tau = tau, omega = omega,
+    subgroup_levels = levels(subgroup),
+    tau_scalar = tau_scalar
+  )
+}
+```
+1. `iterations` is the number of Monte Carlo replications ($R = 4{,}012$ in the published simulation).
+2. Function defaults shown here (`nu = 50`, `rho = 0.6`). The published simulation used `nu = 9`; `rho = 0.6` matches the simulation.
+3. Sample sizes are drawn from a shifted Poisson distribution, capped at 200. This mimics realistic variation in study sizes.
+4. Function defaults shown here (`min_studies = 3`). The published simulation used `min_studies = 4`.
+5. All required packages are loaded inside the function. This is necessary because `simulate_meta()` is designed to run on parallel worker processes that start with a clean environment.
+6. Optional seed for reproducibility. When running in parallel across conditions, each call gets its own seed.
+7. For the compound symmetric (CS) structure, override any heterogeneous-tau parameters. This ensures the DGP uses a single $\tau^2$ for all subgroups.
+8. Build the model formula from the covariate column names (e.g., `"g ~ 0 + Intercept + moderator"`).
+9. The core loop: `map_dfr()` calls `generate_estimate()` for each replication and row-binds the results. The `possibly()` wrapper catches any errors and returns `NULL` for failed iterations, preventing a single failure from crashing the entire simulation.
+10. After all iterations complete, compute performance metrics by calling `assess_performance()`.
+
+The output of `simulate_meta()` is a tibble with one row per (model, coefficient), containing columns for `iterations`, `convergence`, `bias`, `rmse`, `df_M`, `df_SD`, `cover`, and `width`. This is the complete performance summary for a single simulation condition.
+
+Several design choices are worth highlighting:
+
+- **Error handling via `possibly()`**: The outer `possibly()` around `generate_estimate()` catches catastrophic errors (e.g., data generation failures) and drops those iterations entirely. However, SCE non-convergence is handled *inside* `estimate_models()` via a separate `possibly()` call: when `estimate_MV()` fails, the CHE-based backup from `modify_res()` is substituted with `cnvg = FALSE`. These backup results are included in the performance averages (bias, RMSE, coverage), not excluded. Only the `convergence` column in `assess_performance()` tracks the proportion of iterations that did not use fallback estimates.
+- **Package loading inside the function**: The `require()` calls at the top are a pragmatic choice for parallel execution. When `simulate_meta()` is dispatched to a worker via `plyr::mdply(.parallel = TRUE)`, each worker needs its own package environment. This is less elegant than a proper `future` or `targets` setup, but it works.
+- **No intermediate saving**: Results from individual iterations are held in memory and only summarized at the end. For 4,012 iterations this is manageable, but it means that if a job crashes partway through, all progress is lost. The `simhelpers` restructuring will address this.
+
+The complete data flow for a single simulation condition is:
+
+$$
+\text{simulate\_meta()} \xrightarrow{R \text{ times}} \text{generate\_estimate()} \xrightarrow{\text{stack}} \text{assess\_performance()} \rightarrow \text{summary tibble}
+$$
+
+In the next chapter, we restructure this pipeline using `simhelpers` to add Monte Carlo standard errors and gain a cleaner separation between the DGP, estimation, and summarization steps.
+
+## Restructuring with simhelpers {#sec-simhelpers-restructure}
+
+### The simhelpers workflow
+
+The `simhelpers` package [@simhelpers] provides a modular framework for simulation studies that enforces the DSR three-phase structure of @miratrixpustejovsky2024. Rather than writing a monolithic orchestrator like `simulate_meta()`, you decompose the simulation into three separate functions:
+
+1. **`f_generate`** --- a data-generating function (DSR Step 1: Generate),
+2. **`f_analyze`** --- an estimation function whose first argument is the generated data (DSR Step 2: Analyze),
+3. **`f_summarize`** --- a performance summary function whose first argument is the stacked results (DSR Step 4: Summarize).
+
+These are wired together with `bundle_sim()`, which returns a single simulation driver. The driver handles repetition internally via `repeat_and_stack()` (DSR Step 3: Repeat), and can be executed across a grid of conditions using `evaluate_by_row()` (DSR Steps 5--6: Execute).
+
+### Defining a simhelpers-compatible DGP
+
+The key architectural challenge is that `bundle_sim()` expects `f_generate` to be a self-contained function whose arguments are simulation parameters. But our DGP depends on large empirical objects --- the covariate matrix, study IDs, subgroup labels --- that do not fit neatly into an `expand_grid()` parameter grid. The solution is a **closure**: we capture the empirical objects in the enclosing environment of a wrapper function.
+
+```{r}
+#| label: simhelpers-dgp
+#| eval: false
+
+make_dgp <- function(covariates, studyID, subgroup,
+                     sample_sizes, formula_string,
+                     min_studies = 3, max_effects = Inf) {
+
+  studyID <- as.factor(studyID)
+  subgroup <- as.factor(subgroup)
+
+  function(n_studies, tau, omega, rho, nu,
+           beta, tau_covariate, tau_corr, tau_scalar) {
+
+    isPD_subtb <- FALSE
+
+    while (!isPD_subtb) {
+      studyID_sample <- sample(
+        levels(studyID), size = n_studies, replace = FALSE
+      )
+      es_sample <- tapply(
+        seq_along(studyID), studyID,
+        function(x) x %in%
+          if (length(x) <= max_effects) x
+          else sample(x, size = max_effects)
+      )
+      es_sample <- unsplit(es_sample, studyID)
+      sample_indices <- (studyID %in% studyID_sample) & es_sample
+
+      sub_tb <- rowSums(
+        table(subgroup[sample_indices],
+              studyID[sample_indices]) > 0
+      )
+      isPD <- qr(covariates[sample_indices, ])$rank ==
+        ncol(covariates)
+      isPD_subtb <- isPD & all(sub_tb >= min_studies)
+    }
+
+    generate_meta(
+      covariates = covariates[sample_indices, ],
+      studyID = droplevels(studyID[sample_indices]),
+      subgroup = subgroup[sample_indices],
+      sample_sizes = sample_sizes[
+        levels(studyID) %in% studyID_sample
+      ],
+      beta = beta,
+      tau = tau, omega = omega, rho = rho, nu = nu,
+      tau_covariate = tau_covariate[sample_indices],
+      tau_corr = tau_corr, tau_scalar = tau_scalar
+    )
+  }
+}
+```
+
+Note that `min_studies = 3` is the function default inherited from the original code; the published simulation used `min_studies = 4`.
+
+The outer function `make_dgp()` receives the fixed empirical objects once and returns an inner function that takes only the simulation parameters that vary across conditions. The rejection sampling loop stays inside the DGP --- it is part of the data-generating process, not the estimation step.
+
+### Defining a simhelpers-compatible analysis function
+
+The `bundle_sim()` contract requires that all arguments of `f_analyze` except the first (the data) have default values. We fix `formula_string` and the imputed correlation in the closure:
+
+```{r}
+#| label: simhelpers-analyze
+#| eval: false
+
+make_analyze <- function(formula_string, r_imputed = 0.6,
+                         mods = c("robu", "CHE", "SCE", "CMVE")) {
+
+  function(dat, smooth_vi = TRUE) {
+    estimate_models(
+      dat,
+      formula_string = formula_string,
+      r = r_imputed,
+      smooth_vi = smooth_vi,
+      mods = mods
+    )
+  }
+}
+```
+
+### Computing performance with `calc_*()` functions
+
+Instead of writing a custom `assess_performance()` function, `simhelpers` provides purpose-built helpers that compute both the performance metric **and** its Monte Carlo standard error in a single call:
+
+```{r}
+#| label: simhelpers-calc
+#| eval: false
+
+# Bias and RMSE with MCSEs
+calc_absolute(
+  data = results,
+  estimates = est,
+  true_param = param,
+  criteria = c("bias", "rmse")
+)
+
+# Coverage and width with MCSEs
+calc_coverage(
+  data = results,
+  lower_bound = ci_lo,
+  upper_bound = ci_hi,
+  true_param = param
+)
+```
+
+Each function returns a tibble with columns for the criterion value and its MCSE. This is the key advantage over the hand-rolled `assess_performance()`: you get uncertainty quantification for free, following the recommendations of @morris2019.
+
+### Side-by-side comparison
+
+::: {.panel-tabset}
+#### simhelpers
+
+```{r}
+#| label: simhelpers-pipeline
+#| eval: false
+
+# 1. Build closures over empirical objects
+my_dgp <- make_dgp(
+  covariates = covariates, studyID = studyID,
+  subgroup = subgroup, sample_sizes = sample_sizes,
+  formula_string = formula_string
+)
+
+my_analyze <- make_analyze(
+  formula_string = formula_string,
+  r_imputed = 0.6
+)
+
+# 2. Bundle into a simulation driver
+sim_driver <- bundle_sim(
+  f_generate = my_dgp,
+  f_analyze = my_analyze
+)
+
+# 3. Run for one condition (illustrative defaults;
+#    the published simulation used R = 4012, nu = 9)
+raw_results <- sim_driver(
+  reps = 2000,
+  n_studies = 20, tau = 0.2, omega = 0.1,
+  rho = 0.6, nu = 50,
+  beta = beta, tau_covariate = tau_covariate,
+  tau_corr = tau_corr, tau_scalar = 1,
+  seed = 20220101
+)
+
+# 4. Summarize with MCSEs
+raw_results |>
+  group_by(mod, coef) |>
+  group_modify(~ {
+    bind_cols(
+      calc_absolute(.x, estimates = est,
+                    true_param = param,
+                    criteria = c("bias", "rmse")),
+      calc_coverage(.x, lower_bound = ci_lo,
+                    upper_bound = ci_hi,
+                    true_param = param)
+    )
+  })
+```
+
+#### Original P&T
+
+```{r}
+#| label: original-pipeline
+#| eval: false
+
+# Everything in one call (illustrative defaults;
+# the published simulation used iterations = 4012, nu = 9)
+simulate_meta(
+  iterations = 2000,
+  n_studies = 20, tau = 0.2, omega = 0.1,
+  rho = 0.6, nu = 50,
+  covariates = covariates, studyID = studyID,
+  subgroup = subgroup, sample_sizes = sample_sizes,
+  beta = beta,
+  tau_covariate = tau_covariate,
+  tau_corr = tau_corr, tau_scalar = 1,
+  mods = c("robu", "CHE", "SCE", "CMVE"),
+  r_imputed = 0.6,
+  seed = 20220101
+)
+```
+:::
+
+### Advantages of the simhelpers approach
+
+The restructured pipeline offers several benefits over the original @pustejovsky2022 implementation:
+
+- **Modularity and testability.** Each component --- DGP, analysis, summarization --- can be developed and tested in isolation. You can call `my_dgp()` directly to inspect a single generated dataset without running any models.
+- **Automatic MCSEs.** The `calc_absolute()` and `calc_coverage()` functions report Monte Carlo standard errors alongside every performance metric. No additional code is needed.
+- **Compatibility with `evaluate_by_row()`.** Once the driver is bundled, running it across a full parameter grid is a single call: `evaluate_by_row(params, sim_driver)`. This also integrates with `future` for parallel execution.
+- **Connection to DSR.** The three-function decomposition maps directly onto the Develop phase of the DSR workflow, making the simulation design explicit and auditable.
+
+### What we keep from the original
+
+Not everything needs to change. The restructuring preserves the core logic of @miratrixpustejovsky2024:
+
+- **The empirical covariate structure.** The design matrices, study IDs, and subgroup labels come from real datasets and cannot be parameterized as simple scalars. The closure pattern handles this cleanly.
+- **The rejection sampling logic.** This stays inside the DGP wrapper. It is genuinely part of the data-generating process --- ensuring a valid design before generating outcomes.
+- **The `estimate_models()` function.** The estimation code is unchanged; the `make_analyze()` wrapper simply fixes the arguments that do not vary across conditions.
+
+
+## Exercises {.unnumbered}
+
+::: {.callout-caution title="Exercise 8.1: Running a mini simulation"}
+Using the code from this chapter, run a small-scale simulation with $R = 10$ replications for a single condition (`n_studies = 60`, `tau = 0.10`, `omega = 0`, `rho = 0.6`, `struct = 'CS'`). Inspect the raw iteration-level results before summarization. How much variability do you see across the 10 replications for a single coefficient?
+
+::: {.callout-tip title="Hint" collapse="true"}
+Call `generate_estimate()` in a loop with `map_dfr(1:10, ...)`. Before calling `assess_performance()`, examine the raw tibble to see the spread of coefficient estimates.
+:::
+:::

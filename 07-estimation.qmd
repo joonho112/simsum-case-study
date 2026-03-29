@@ -1,0 +1,669 @@
+# Implementing the Working Models {#sec-estimation}
+
+```{r}
+#| label: setup-estimation
+#| include: false
+source("_common.R")
+```
+
+```{r}
+#| label: source-functions
+#| include: false
+source("R/simulation-functions.R")
+```
+
+The previous two chapters built the data-generating side of the simulation: `generate_smd()` produces effect sizes for a single study (@sec-generate-smd), and `generate_meta()` assembles a full meta-analytic dataset (@sec-generate-meta). Now we turn to the **Methods** component of the ADEMP framework --- the estimation functions that are applied to each generated dataset.
+
+For every simulated dataset, @pustejovsky2022 fit three working models --- CE, CHE, and SCE --- and extract from each:
+
+- coefficient estimates $\hat{\boldsymbol{\beta}}$,
+- robust standard errors and 95% confidence intervals (via CR2 small-sample corrections),
+- Satterthwaite degrees of freedom, and
+- variance component estimates ($\hat{\tau}^2$, and where applicable $\hat{\omega}^2$).
+
+All three models use CR2 robust variance estimation from the `clubSandwich` package [@pustejovsky2020] with an assumed working correlation of $\rho = 0.6$. This is the defining feature of the RVE framework: even if the working model is mis-specified relative to the true data-generating process, the CR2-corrected inferences remain valid [@tiptonpustejovsky2015].
+
+This chapter covers all three working models. We begin with CE and CHE, then turn to the SCE model and the wrapper function that ties everything together.
+
+
+## Overview of the estimation strategy {#sec-estimation-overview}
+
+The simulation follows a common pattern in Monte Carlo studies of meta-analytic methods: generate data under a known DGP, then fit multiple candidate models to see how they perform. The three working models differ in their assumptions about heterogeneity structure:
+
+| Working model | Variance components | Estimation | Weights |
+|:---|:---|:---|:---|
+| CE ("robu") | $\tau^2$ | Method of moments | Semi-efficient (diagonal) |
+| CHE | $\tau^2, \omega^2$ | REML | Fully inverse-variance |
+| SCE | $\tau_1^2, \ldots, \tau_C^2$ | REML | Fully inverse-variance |
+
+: Summary of the three working models {#tbl-working-models}
+
+Despite their different internal machinery, all three models produce the same type of output: a tibble with one row per coefficient (plus rows for variance components), containing point estimates, degrees of freedom, and confidence interval bounds. This uniform output structure is essential --- the downstream performance assessment code (@sec-performance-metrics) does not need to know which model produced a given row.
+
+A critical design decision is that **all inference is robust**. The coefficient-level standard errors, degrees of freedom, and confidence intervals do not come from the model's own variance-covariance matrix. Instead, they come from `clubSandwich::conf_int()`, which applies the CR2 bias correction of @tiptonpustejovsky2015. This means the working model serves as a vehicle for obtaining point estimates and weights, but the inferential validity does not depend on the model being correctly specified.
+
+::: {.callout-note}
+## Why CR2 and Satterthwaite degrees of freedom?
+
+All three working models in this simulation use the CR2 bias-corrected robust variance estimator from **clubSandwich** [@pustejovsky2020], with Satterthwaite degrees of freedom for $t$-based confidence intervals [@tiptonpustejovsky2015].
+
+**Why not just use model-based standard errors?** Because meta-analytic standard errors depend on the variance-covariance structure being correctly specified. If the working model is wrong (as it often is), model-based SEs can be too small or too large. The CR2 sandwich estimator corrects for this misspecification.
+
+**Why not the original HC0 sandwich estimator?** In finite samples, the uncorrected sandwich estimator is biased downward, producing CIs that are too narrow. The CR2 correction adjusts for this bias, particularly important when the number of clusters (studies) is small --- exactly the regime P&T are studying with $J = 30$.
+
+**Why Satterthwaite degrees of freedom?** Standard $z$-based inference assumes the sandwich estimator is approximately normal, which requires many clusters. With $J = 30$ or fewer studies per predictor category, a $t$-distribution with estimated degrees of freedom provides better-calibrated confidence intervals.
+
+If you attempt to reproduce P&T's results using model-based SEs from `metafor` instead of CR2 SEs from `clubSandwich`, you will get different (and generally less reliable) standard errors and confidence intervals.
+:::
+
+
+## The CE model: `estimate_robu()` {#sec-ce-model}
+
+The correlated effects (CE) working model is the simplest of the three. It assumes a single between-study random effect $u_j$ with variance $\tau^2$ and treats all effect sizes within a study as sharing a common sampling correlation $\rho$. This is the model underlying the `robumeta` package [@hedges2010], but here the authors implement it from scratch to gain compatibility with `clubSandwich`.
+
+
+### Why a handmade implementation? {#sec-why-handmade}
+
+The `robumeta` package provides a polished implementation of CE estimation, so why rewrite it? The answer is practical: `clubSandwich::vcovCR()` needs S3 methods for `bread()` and `model.matrix()` to compute the CR2 adjustment. The `robumeta` package does not export these methods in a form that `clubSandwich` can consume directly. Rather than patching `robumeta`, the authors wrote `robu_handmade()` --- a lean reimplementation that stores the design matrix and weights in a custom `"handmade"` class, with the two required S3 methods defined alongside it.
+
+
+### Helper functions {#sec-helpers}
+
+Two small utilities support the moment estimation algebra. `mat_split()` partitions a matrix by a grouping factor, and `trace_product()` computes $\text{tr}(\mathbf{A}\mathbf{B})$ without forming the full matrix product:
+
+```{r}
+#| label: helper-functions
+#| eval: false
+#| code-fold: true
+#| code-summary: "mat_split() and trace_product()"
+
+# Split a matrix into a list of sub-matrices by grouping factor
+mat_split <- function(mat, f) {
+  lapply(unique(f), function(l) mat[f==l,,drop=FALSE])
+}
+
+# Compute tr(AB) efficiently via vectorized element-wise product
+trace_product <- function(A, B) {
+  a_vec <- as.vector(t(A))
+  b_vec <- as.vector(B)
+  sum(a_vec * b_vec)
+}
+```
+
+The trace product $\text{tr}(\mathbf{AB}) = \sum_{i,j} A_{ij} B_{ji}$ appears repeatedly in the moment estimator for $\tau^2$. Computing it via element-wise multiplication avoids allocating a full $p \times p$ matrix product.
+
+
+### The moment estimator: `robu_handmade()` {#sec-robu-handmade}
+
+```{r}
+#| label: robu-handmade-code
+#| eval: false
+#| code-fold: true
+#| code-summary: "Full robu_handmade() function"
+
+robu_handmade <- function(X, y, v, cluster, rho = .8, calc_vcov = NULL) {
+
+  k_j <- as.numeric(table(cluster))
+  sigma_sq_j <- tapply(v, cluster, mean)
+
+  m <- length(k_j)
+
+  w_tilde <- 1 / (k_j * sigma_sq_j)
+  w_tilde_j <- rep(w_tilde, k_j)
+
+  mod_prelim <- lm.wfit(x = X, y = y, w = w_tilde_j)
+
+  res <- residuals(mod_prelim)
+
+  # calculate weighted residual sum of squares
+  QE <- sum(w_tilde_j * res^2)
+
+  # split the design matrix by study
+  X_j <- mat_split(X, cluster)
+
+  # Create M tilde
+  M_tilde <- chol2inv(chol(crossprod(X, w_tilde_j * X)))
+  p_j <- lapply(X_j, colSums)
+
+  # trace products
+
+  # the first B for the trace product numerator
+  w_over_k <- w_tilde / k_j
+  B_num_all_1 <- Map(function(w, X) w * crossprod(X), w = w_over_k, X = X_j)
+  B_num_1 <- reduce(B_num_all_1, `+`)
+
+  # the second B for the trace product numerator
+  XJX_j <- lapply(p_j, tcrossprod)
+  B_num_all_2 <- Map(function(w, xjx) w * xjx, w = w_over_k, xjx = XJX_j)
+  B_num_2 <- reduce(B_num_all_2, `+`)
+
+  # the B for the trace product denominator
+  B_den_all <- Map(function(w, xjx) w^2 * xjx, w = w_tilde, xjx = XJX_j)
+  B_den <- reduce(B_den_all, `+`)
+
+  num_minus <- m - (1 - rho) * trace_product(M_tilde, B_num_1) -
+    rho * trace_product(M_tilde, B_num_2)
+  den <- sum(k_j * w_tilde) - trace_product(M_tilde, B_den)
+
+  tau_sq <- (QE - num_minus) / den
+  tau_sq <- ifelse(tau_sq < 0, 0, tau_sq)
+
+  # CE weights
+  w_j <- 1 / (k_j * (sigma_sq_j + tau_sq))
+  w_ij <- rep(w_j, k_j)
+
+  # fit WLS regression
+  mod_CE <- lm.wfit(x = X, y = y, w = w_ij)
+
+  res <- mod_CE[c("coefficients","residuals","fitted.values","weights")]
+  res$tau_sq <- tau_sq
+
+  res$X <- X
+  res$w_ij <- w_ij
+  res$cluster <- cluster
+  res$k_j <- k_j
+  res$sigma_sq_j <- sigma_sq_j
+  res$w_tilde_j <- w_tilde_j
+  res$num_minus <- num_minus
+  res$den <- den
+  res$nobs <- sum(k_j)
+
+  class(res) <- "handmade"
+
+  if (!is.null(calc_vcov)) {
+    res$vcov <- vcovCR(res, cluster = cluster, type = calc_vcov, inverse_var = TRUE)
+  }
+
+  return(res)
+}
+
+model.matrix.handmade <- function(object, ...) object$X
+
+bread.handmade <- function(x, ...) {
+  x$nobs * chol2inv(chol(crossprod(x$X, x$w_ij * x$X)))
+}
+```
+
+The function proceeds in three stages:
+
+**Stage 1: Preliminary fit with study-level weights.** Initial weights $\tilde{w}_j = 1 / (k_j \bar{\sigma}^2_j)$ ignore between-study heterogeneity. The weighted least squares fit under these weights yields residuals used to form the weighted residual sum of squares $Q_E = \sum_{j} \tilde{w}_j r_j^2$.
+
+**Stage 2: Moment estimation of $\tau^2$.** The method-of-moments estimator solves $E[Q_E] = Q_E$ for $\tau^2$. This requires computing several trace products involving the preliminary weight matrix $\tilde{\mathbf{M}}$ and study-level design matrix summaries. The formula is:
+$$
+\hat{\tau}^2 = \frac{Q_E - \left[m - (1-\rho)\,\text{tr}(\tilde{\mathbf{M}}\mathbf{B}_1) - \rho\,\text{tr}(\tilde{\mathbf{M}}\mathbf{B}_2)\right]}{\sum_j k_j \tilde{w}_j - \text{tr}(\tilde{\mathbf{M}}\mathbf{B}_{\text{den}})}
+$$
+where $m$ is the number of studies and the $\mathbf{B}$ matrices are quadratic forms of the study-level design matrices weighted by $\tilde{w}_j$. If the estimate is negative, it is truncated to zero.
+
+**Stage 3: Final WLS with CE weights.** The final weights incorporate the estimated between-study variance: $w_j = 1 / [k_j(\bar{\sigma}^2_j + \hat{\tau}^2)]$. These are the "semi-efficient" diagonal weights that give each effect size within a study equal weight. The final WLS fit produces the coefficient estimates $\hat{\boldsymbol{\beta}}$.
+
+The returned object is assigned class `"handmade"`, and the two S3 methods make it compatible with `clubSandwich`:
+
+- `model.matrix.handmade()` returns the stored design matrix `X`.
+- `bread.handmade()` returns $n \cdot (\mathbf{X}'\mathbf{W}\mathbf{X})^{-1}$, the "bread" of the sandwich estimator.
+
+
+### The wrapper: `estimate_robu()` {#sec-estimate-robu}
+
+```{r}
+#| label: estimate-robu-code
+#| eval: false
+#| code-fold: true
+#| code-summary: "Full estimate_robu() function"
+
+estimate_robu <- function(dat, formula_string, r) {
+
+  X <- model.matrix(as.formula(formula_string), data = dat)
+
+  mod <- robu_handmade(X = X, y = dat$g, v = dat$var_g,
+                        cluster = dat$studyID,
+                        rho = r)
+
+  varcomp <- tibble(coef = "tau2", est = mod$tau_sq)
+
+  coef_CI <- conf_int(mod, cluster = dat$studyID, vcov = "CR2", inverse_var = TRUE)
+
+  tibble(
+    coef = rownames(coef_CI),
+    est = coef_CI$beta,
+    df = coef_CI$df,
+    ci_lo = coef_CI$CI_L,
+    ci_hi = coef_CI$CI_U
+  ) %>%
+    bind_rows(varcomp) %>%
+    mutate(
+      mod = "robu",
+      cnvg = TRUE
+    )
+}
+```
+
+The wrapper does three things:
+
+1. **Builds the design matrix** from the formula string (e.g., `"g ~ 0 + dv_cat + ..."`) and the dataset.
+2. **Fits the CE model** via `robu_handmade()`, passing the assumed working correlation `r` (fixed at 0.6 in the simulation).
+3. **Extracts CR2-corrected inference** via `clubSandwich::conf_int()`, which returns coefficient estimates, Satterthwaite degrees of freedom, and 95% confidence interval bounds.
+
+The output is a tidy tibble with columns `coef`, `est`, `df`, `ci_lo`, `ci_hi`, `mod`, and `cnvg`. The variance component $\hat{\tau}^2$ is appended as an additional row (with `df`, `ci_lo`, `ci_hi` as `NA`). The `cnvg` column is always `TRUE` for the CE model since the moment estimator is a closed-form solution --- it cannot fail to converge.
+
+
+## The CHE model: `estimate_CHE()` {#sec-che-model}
+
+The correlated-and-hierarchical effects (CHE) working model extends CE by adding a within-study random effect $v_{ij}$ with variance $\omega^2$. This two-level random effects structure --- between-study ($\tau^2$) and within-study ($\omega^2$) --- is estimated via REML using `metafor::rma.mv()` [@viechtbauer2010].
+
+
+### The V matrix {#sec-v-matrix}
+
+A key input to `rma.mv()` is the block-diagonal sampling covariance matrix $\mathbf{V}$. Since the true within-study sampling correlations are unknown in practice (they depend on the correlation between outcomes, which is rarely reported), the CHE model uses an **imputed** covariance matrix constructed from the marginal sampling variances and an assumed constant correlation.
+
+`clubSandwich::impute_covariance_matrix()` constructs $\mathbf{V}$ with:
+
+- `vi = dat$var_g` --- the sampling variances of each effect size,
+- `cluster = dat$studyID` --- the study grouping,
+- `r` = 0.6 --- the assumed within-study sampling correlation,
+- `smooth_vi = TRUE` --- replaces each study's sampling variances with their study-level average before constructing the off-diagonal elements.
+
+The `smooth_vi = TRUE` option is important: it ensures that the imputed covariance matrix for each study has a compound symmetric structure (equal off-diagonal elements), which is the structure assumed by the CE working model. Without smoothing, the off-diagonal entries would be $r \sqrt{v_{hj} v_{ij}}$, introducing variation that does not correspond to any particular model.
+
+
+### The `estimate_CHE()` function {#sec-estimate-che-fn}
+
+```{r}
+#| label: estimate-che-code
+#| eval: false
+#| code-fold: true
+#| code-summary: "Full estimate_CHE() function"
+
+estimate_CHE <- function(dat, formula_string, r, smooth_vi = TRUE) {
+
+  V_mat <- impute_covariance_matrix(dat$var_g,
+                                    cluster = dat$studyID,
+                                    r = r,
+                                    smooth_vi = smooth_vi)
+
+  mod <- rma.mv(as.formula(formula_string),
+                V = V_mat,
+                random = ~ 1 | studyID / esID,
+                data = dat, sparse = TRUE)
+
+  varcomp <- tibble(coef = c("tau2","omega2"), est = mod$sigma2)
+  coef_CI <- conf_int(mod, vcov = "CR2")
+
+  tibble(
+    coef = rownames(coef_CI),
+    est = coef_CI$beta,
+    df = coef_CI$df,
+    ci_lo = coef_CI$CI_L,
+    ci_hi = coef_CI$CI_U
+  ) %>%
+    bind_rows(varcomp) %>%
+    mutate(
+      mod = "CHE",
+      cnvg = TRUE
+    )
+
+}
+```
+
+The function proceeds as follows:
+
+1. **Construct the imputed V matrix** via `impute_covariance_matrix()` with the assumed correlation `r` and smoothed sampling variances.
+2. **Fit the CHE model** with `rma.mv()`, specifying `random = ~ 1 | studyID / esID` for the two-level random effects structure. The `sparse = TRUE` option uses sparse matrix algebra for the V matrix, which speeds computation when datasets have many effect sizes.
+3. **Extract REML variance components**: `mod$sigma2` returns a two-element vector $(\hat{\tau}^2, \hat{\omega}^2)$.
+4. **Compute CR2-corrected inference** via `clubSandwich::conf_int()`. Note that for `rma.mv` objects, `clubSandwich` has built-in S3 methods, so no custom `bread()` or `model.matrix()` methods are needed.
+
+The output format matches `estimate_robu()` exactly --- a tibble with `coef`, `est`, `df`, `ci_lo`, `ci_hi`, `mod`, and `cnvg` columns. The CHE model produces two variance component rows (`tau2` and `omega2`) rather than one.
+
+**Convergence.** The `cnvg` column is hardcoded to `TRUE` because the two-level CHE model with REML estimation always converged in the simulation. This is expected: the two-variance-component model is relatively simple, and REML for nested random effects is well-behaved. The SCE model, with its $C$ separate variance components, will require more careful convergence handling (covered below in @sec-sce-cmve-estimation).
+
+
+## Comparing CE and CHE output {#sec-ce-vs-che}
+
+To make the output structures concrete, let us apply both estimation functions to a single generated dataset. We load the TSL15-derived design data, generate one dataset under a CHE data-generating process ($\tau = 0.10$, $\omega = 0.10$), and fit both models.
+
+```{r}
+#| label: comparison-example
+#| eval: false
+
+# Load the TSL15-derived model data
+load("data/dv-model-data.Rdata")
+
+# Generate one dataset under CHE DGP
+set.seed(20240101)
+dat <- generate_meta(
+  covariates = covariates,
+  studyID = studyID,
+  subgroup = dv_cat,
+  sample_sizes = sample_sizes,
+  beta = beta,
+  tau = 0.10,
+  omega = 0.10,
+  rho = 0.6,
+  nu = 9
+)
+
+# Define the model formula (no intercept, all covariates)
+formula_string <- "g ~ 0 + dv_cat + followup + propCollege + propMale + attrit"
+
+# Fit CE model
+res_CE <- estimate_robu(dat, formula_string, r = 0.6)
+
+# Fit CHE model
+res_CHE <- estimate_CHE(dat, formula_string, r = 0.6)
+```
+
+### Coefficient estimates side by side
+
+```{r}
+#| label: compare-coefs
+#| eval: false
+
+# Extract coefficient rows (exclude variance components)
+coefs_CE <- res_CE %>% filter(!coef %in% c("tau2", "omega2"))
+coefs_CHE <- res_CHE %>% filter(!coef %in% c("tau2", "omega2"))
+
+comparison <- coefs_CE %>%
+  select(coef, est_CE = est, df_CE = df, ci_lo_CE = ci_lo, ci_hi_CE = ci_hi) %>%
+  left_join(
+    coefs_CHE %>%
+      select(coef, est_CHE = est, df_CHE = df, ci_lo_CHE = ci_lo, ci_hi_CHE = ci_hi),
+    by = "coef"
+  ) %>%
+  mutate(
+    width_CE = ci_hi_CE - ci_lo_CE,
+    width_CHE = ci_hi_CHE - ci_lo_CHE,
+    relative_width = width_CHE / width_CE
+  )
+
+comparison %>%
+  select(coef, est_CE, est_CHE, width_CE, width_CHE, relative_width) %>%
+  knitr::kable(digits = 3, caption = "CE vs CHE: coefficient estimates and CI widths")
+```
+
+What to expect from this comparison:
+
+- **Point estimates** ($\hat{\boldsymbol{\beta}}$) should be similar between the two models. Both are consistent under the RVE framework, regardless of which working model is used.
+- **CI widths** should differ, particularly for the `dv_cat` coefficients. Because `dv_cat` varies *within* studies, the CHE model's fully inverse-variance weights can exploit within-study information more efficiently than the CE model's diagonal weights. The `relative_width` column should show values below 1.0 for the `dv_cat` coefficients, indicating that CHE produces tighter intervals.
+- **Degrees of freedom** from the Satterthwaite approximation may also differ between the two models, since the CR2 adjustment depends on the model's weight structure.
+- For study-level covariates (like `followup`, `propCollege`, `propMale`, `attrit`), the efficiency gains from CHE are typically smaller, since within-study information is less relevant for predictors that do not vary within studies.
+
+### Variance components
+
+```{r}
+#| label: compare-varcomp
+#| eval: false
+
+# CE provides only tau2; CHE provides tau2 and omega2
+varcomp_CE <- res_CE %>% filter(coef %in% c("tau2", "omega2"))
+varcomp_CHE <- res_CHE %>% filter(coef %in% c("tau2", "omega2"))
+
+bind_rows(
+  varcomp_CE %>% mutate(model = "CE"),
+  varcomp_CHE %>% mutate(model = "CHE")
+) %>%
+  select(model, coef, est) %>%
+  knitr::kable(digits = 4, caption = "Variance component estimates")
+```
+
+The CE model produces only $\hat{\tau}^2$ (the between-study variance), estimated via the method of moments. The CHE model produces both $\hat{\tau}^2$ and $\hat{\omega}^2$ (within-study variance) via REML. Under the true CHE data-generating process with $\tau = 0.10$ and $\omega = 0.10$, the true values are $\tau^2 = 0.01$ and $\omega^2 = 0.01$. The CE model's $\hat{\tau}^2$ will tend to absorb some of the within-study heterogeneity, since it has no $\omega^2$ parameter to capture it separately.
+
+This single-dataset comparison illustrates the structural differences between the two models. The simulation study (@sec-performance-metrics) will assess whether these patterns hold systematically across thousands of replications and multiple data-generating conditions.
+
+
+## The SCE and CMVE models: `estimate_MV()` {#sec-sce-cmve-estimation}
+
+The third and fourth working models --- SCE (subgroup correlated effects) and CMVE (correlated multivariate effects) --- both use `metafor::rma.mv()` with a multivariate random effects structure: `random = ~ subgroup | studyID`. What distinguishes them is the `struct` argument: `"DIAG"` for SCE (separate $\tau^2_c$ per subgroup category) and `"HCS"` for CMVE (heterogeneous compound symmetric, adding a between-category correlation). Because these models estimate $C$ or more variance parameters simultaneously, convergence is no longer guaranteed, and the implementation must handle failures gracefully.
+
+
+### Starting values: `starting_taus()` {#sec-starting-taus}
+
+REML optimization for a multivariate model with $C$ variance components can be sensitive to starting values. If the optimizer begins far from the solution, it may converge to a boundary or fail entirely. The strategy adopted by @pustejovsky2022 is to obtain reasonable starting values by fitting **separate CE models per subgroup category**, each estimating a single $\tau^2$:
+
+```{r}
+#| label: starting-taus-code
+#| eval: false
+#| code-fold: true
+#| code-summary: "starting_taus() function"
+
+starting_taus <- function(dat, V_mat, formula_string) {
+
+  f <- function(sub, frml) suppressWarnings(
+    rma.mv(as.formula(frml), V = V_mat, random = ~ 1 | studyID,
+           data = dat, sparse = TRUE, subset = subgroup == sub)$sigma2
+  )
+
+  tau2_starts <- lapply(levels(dat$subgroup), safely(f, NA), frml = formula_string)
+  tau2_starts <- sapply(tau2_starts, function(x) x$result)
+
+  if (any(is.na(tau2_starts))) {
+    tau2_NULLs <- lapply(levels(dat$subgroup)[is.na(tau2_starts)], safely(f, NA), frml = "g ~ 1")
+    tau2_NULLs <- sapply(tau2_NULLs, function(x) x$result)
+
+    tau2_starts[is.na(tau2_starts)] <- tau2_NULLs
+  }
+
+  tau2_starts
+}
+```
+
+The function iterates over the levels of `dat$subgroup`, fitting a univariate `rma.mv()` with `random = ~ 1 | studyID` to the subset of effect sizes in each category. Each fit is wrapped in `purrr::safely()` so that a failure in one subgroup does not abort the whole process. If a subgroup-specific model with the full covariate formula fails (perhaps because a subgroup has too few studies to support all predictors), the function falls back to an intercept-only model (`"g ~ 1"`) for that subgroup. The resulting vector of $\hat{\tau}^2$ values is passed to `rma.mv()` via `control = list(tau2.init = ...)`.
+
+
+### The `estimate_MV()` function {#sec-estimate-mv}
+
+```{r}
+#| label: estimate-mv-code
+#| eval: false
+#| code-fold: true
+#| code-summary: "Full estimate_MV() function"
+
+estimate_MV <- function(dat, formula_string, r, struct = "HCS",
+                        smooth_vi = TRUE, pre_estimate = FALSE) {
+
+  sub <- if (struct == "DIAG") dat$subgroup else NULL
+
+  V_mat <- impute_covariance_matrix(dat$var_g,
+                                    cluster = dat$studyID,
+                                    r = r,
+                                    subgroup = sub,
+                                    smooth_vi = smooth_vi)
+
+  if (pre_estimate) {
+
+    tau2_starts <- starting_taus(dat, V_mat, formula_string)
+
+    mod <- safely(rma.mv)(as.formula(formula_string),
+                          V = V_mat,
+                          random = ~ subgroup | studyID, struct = struct,
+                          data = dat, sparse = TRUE,
+                          control = list(tau2.init = tau2_starts))
+
+    if (is.null(mod$result)) {
+      mod <- rma.mv(as.formula(formula_string),
+                    V = V_mat,
+                    random = ~ subgroup | studyID, struct = struct,
+                    data = dat, sparse = TRUE,
+                    tau2 = tau2_starts)
+    } else {
+      mod <- mod$result
+    }
+
+  } else {
+    mod <- rma.mv(as.formula(formula_string),
+                  V = V_mat,
+                  random = ~ subgroup | studyID, struct = struct,
+                  data = dat, sparse = TRUE)
+  }
+
+  varcomp <- tibble(
+    coef = paste("tau2", names(mod$g.levels.k), sep = "_"),
+    est = mod$tau2
+  )
+
+  coef_CI <- conf_int(mod, vcov = "CR2")
+
+  tibble(
+    coef = rownames(coef_CI),
+    est = coef_CI$beta,
+    df = coef_CI$df,
+    ci_lo = coef_CI$CI_L,
+    ci_hi = coef_CI$CI_U
+  ) %>%
+    bind_rows(varcomp) %>%
+    mutate(
+      mod = paste("MV", struct, sep = "-"),
+      cnvg = TRUE
+    )
+}
+```
+
+The function handles both model structures through a single code path, controlled by the `struct` argument:
+
+- **`struct = "DIAG"` (SCE model).** The random effects structure `~ subgroup | studyID` with a diagonal covariance matrix estimates a separate $\tau^2_c$ for each subgroup category. The categories are assumed independent at the between-study level. When `struct = "DIAG"`, the `subgroup` variable is also passed to `impute_covariance_matrix()` so that the imputed V matrix is block-diagonal *within* subgroups (not just within studies).
+- **`struct = "HCS"` (CMVE model).** The heterogeneous compound symmetric structure estimates separate $\tau^2_c$ values *and* a common between-category correlation $\rho_{\tau}$. The `subgroup` argument to `impute_covariance_matrix()` is `NULL`, so the V matrix is block-diagonal within studies only (same as CHE).
+
+**Convergence strategy.** When `pre_estimate = TRUE`, the function first obtains starting values from `starting_taus()`, then attempts the full REML fit with these as initial values (`tau2.init`). If this first attempt fails (detected by `safely()` returning `NULL`), the function retries with `tau2 = tau2_starts`, which fixes the variance components at the starting values rather than estimating them --- effectively treating the starting values as known. This produces coefficient estimates and CR2 inference without successful REML convergence. Critically, the output still sets `cnvg = TRUE` for this fixed-tau2 path, because the function does not distinguish between genuine REML convergence and the fixed-value fallback.
+
+::: {.callout-important}
+## Convergence reporting nuance
+The `cnvg` column in the results does not distinguish between three different estimation outcomes for SCE: (1) direct REML convergence, (2) convergence using per-category starting values as fixed final tau2 values (`cnvg = TRUE` despite not being full REML), and (3) complete failure replaced by CHE backup estimates (`cnvg = FALSE`). Readers should interpret the SCE convergence rate as an upper bound on the proportion of true REML convergences.
+:::
+
+The variance component rows use category-specific labels (e.g., `tau2_Academic`, `tau2_Behavioral`) extracted from `mod$g.levels.k`, making it straightforward to track which $\hat{\tau}^2_c$ corresponds to which subgroup in downstream performance assessment.
+
+
+### The `modify_res()` fallback {#sec-modify-res}
+
+When `estimate_MV()` itself fails entirely (not just the REML optimizer, but the whole function), the simulation needs a fallback result. `modify_res()` takes the CHE results and reshapes them into the SCE/CMVE output format, setting `cnvg = FALSE`:
+
+```{r}
+#| label: modify-res-code
+#| eval: false
+#| code-fold: true
+#| code-summary: "modify_res() fallback function"
+
+modify_res <- function(res, new_mod, subgroup_levels) {
+
+  varcomp <-
+    res %>%
+    filter(coef == "tau2") %>%
+    select(-coef) %>%
+    crossing(coef = paste("tau2", subgroup_levels, sep = "_"))
+
+  res %>%
+    filter(! coef %in% c("tau2","omega2")) %>%
+    bind_rows(varcomp) %>%
+    mutate(mod = new_mod, cnvg = FALSE)
+}
+```
+
+The function takes the CHE model's single $\hat{\tau}^2$ and duplicates it into $C$ rows, one per subgroup category. The coefficient rows (point estimates, CIs, degrees of freedom) are preserved unchanged from the CHE fit. The `cnvg` column is set to `FALSE`, which flags these rows as non-converged in the convergence rate metric. However, these CHE-based backup estimates are **not excluded** from the performance averages: they are included alongside the successfully converged SCE estimates when computing bias, RMSE, and coverage. This design ensures that every simulated dataset produces an output row for every model, even when estimation fails --- an important property for computing performance metrics across replications --- but it means that performance metrics for SCE reflect a mixture of genuine SCE estimates and CHE-based substitutes.
+
+
+## The unified wrapper: `estimate_models()` {#sec-estimate-models}
+
+The top-level function `estimate_models()` takes a single generated dataset and fits all requested working models, returning a single stacked tibble:
+
+```{r}
+#| label: estimate-models-code
+#| eval: false
+#| code-fold: true
+#| code-summary: "Full estimate_models() wrapper"
+
+estimate_models <- function(dat, formula_string, r = 0.6, smooth_vi = TRUE,
+                            mods = c("robu","CHE","SCE","CMVE")) {
+
+  res <- tibble()
+
+  if ("robu" %in% mods) {
+    res <-
+      estimate_robu(dat, formula_string, r) %>%
+      bind_rows(res)
+  }
+
+  if ("CHE" %in% mods) {
+    res_CHE <- estimate_CHE(dat, formula_string, r, smooth_vi = smooth_vi)
+    res <- bind_rows(res, res_CHE)
+  }
+
+  if ("SCE" %in% mods) {
+    res_backup <- modify_res(res_CHE, new_mod = "MV-DIAG",
+                             subgroup_levels = levels(dat$subgroup))
+    res <-
+      possibly(estimate_MV, res_backup)(
+        dat, formula_string, r, struct = "DIAG",
+        smooth_vi = smooth_vi, pre_estimate = TRUE
+      ) %>%
+      bind_rows(res)
+  }
+
+  if ("CMVE" %in% mods) {
+    res_backup <- modify_res(res_CHE, new_mod = "MV-HCS",
+                             subgroup_levels = levels(dat$subgroup))
+    res <-
+      possibly(estimate_MV, res_backup)(
+        dat, formula_string, r, struct = "HCS",
+        smooth_vi = smooth_vi, pre_estimate = TRUE
+      ) %>%
+      bind_rows(res)
+  }
+
+  res
+}
+```
+
+Several design choices are worth noting:
+
+1. **Execution order matters.** CHE is always fit before SCE or CMVE, because the multivariate models need `res_CHE` as their fallback. The CE model (`"robu"`) has no such dependency and is fit first.
+2. **Error handling via `purrr::possibly()`.** Each call to `estimate_MV()` is wrapped in `possibly()` with the CHE-derived backup as the default value. If `estimate_MV()` throws an error for any reason --- convergence failure, singular Hessian, numerical issues --- the backup result (with `cnvg = FALSE`) is used silently.
+3. **Flexible model selection.** The `mods` argument accepts any subset of the four model names, so the same wrapper can be used for quick debugging (fit only CE) or the full simulation (all four models).
+
+The output is a tibble with columns `coef`, `est`, `df`, `ci_lo`, `ci_hi`, `mod`, and `cnvg`. Each model contributes its coefficient rows plus variance component rows, all stacked together. This is the object that gets passed to the performance metric functions in @sec-performance-metrics.
+
+
+## Practical comparison {#sec-practical-comparison}
+
+To see all four models in action, we apply `estimate_models()` to a single generated dataset:
+
+```{r}
+#| label: all-models-comparison
+#| eval: false
+
+# Generate one dataset (using objects from the earlier example)
+set.seed(20240101)
+dat <- generate_meta(
+  covariates = covariates,
+  studyID = studyID,
+  subgroup = dv_cat,
+  sample_sizes = sample_sizes,
+  beta = beta,
+  tau = 0.10,
+  omega = 0.10,
+  rho = 0.6,
+  nu = 9
+)
+
+formula_string <- "g ~ 0 + dv_cat + followup + propCollege + propMale + attrit"
+
+# Fit all four models
+all_res <- estimate_models(dat, formula_string, r = 0.6)
+```
+
+```{r}
+#| label: all-models-table
+#| eval: false
+
+# Compare coefficient estimates across models
+all_res %>%
+  filter(!str_detect(coef, "^tau2|^omega2")) %>%
+  select(mod, coef, est, df, ci_lo, ci_hi) %>%
+  mutate(ci_width = ci_hi - ci_lo) %>%
+  arrange(coef, mod) %>%
+  knitr::kable(digits = 3, caption = "Coefficient estimates across all four working models")
+```
+
+What to look for in this table:
+
+- **Point estimates** should be broadly similar across all four models, since all use CR2-corrected inference and the same underlying data.
+- **CI widths** for the `dv_cat` coefficients (which vary within studies) should be narrower for the multivariate models (SCE, CMVE) than for CE, with CHE falling in between. This reflects the efficiency gains from exploiting within-study information via inverse-variance weights.
+- **Degrees of freedom** may differ noticeably, particularly between CE (which uses method-of-moments weights) and the REML-based models. Lower degrees of freedom produce wider intervals via the $t$-distribution, partially offsetting any gains from tighter standard errors.
+- **Timing.** The CE model is fastest (closed-form moment estimator). CHE requires one REML optimization. SCE and CMVE each require the starting-value fits plus the main REML optimization, making them the slowest. In the full simulation with thousands of replications, these timing differences accumulate --- one reason the authors use `purrr::possibly()` rather than expensive retry loops.

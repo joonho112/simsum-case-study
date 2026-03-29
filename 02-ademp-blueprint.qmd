@@ -1,0 +1,392 @@
+# The ADEMP Blueprint for P&T (2022) {#sec-ademp-blueprint}
+
+```{r}
+#| label: setup-ademp-blueprint
+#| include: false
+source("_common.R")
+```
+
+Before writing a single line of simulation code, we need to understand *what* we are building. This chapter performs a complete ADEMP decomposition [@morris2019] of the @pustejovsky2022 simulation, mapping every design decision onto a structured framework. Think of this as the architectural blueprint: it specifies what the simulation must do, why each component exists, and how the pieces connect. The remaining chapters implement each component in turn.
+
+
+## The ADEMP Framework Revisited {#sec-ademp-revisited}
+
+The ADEMP framework, introduced by @morris2019 and covered in depth in [Mini Course 1](https://joonho112.github.io/simsum-mini-course/), decomposes any simulation study into five components: **A**ims (what questions does the simulation answer?), **D**ata-generating mechanisms (how are synthetic data created?), **E**stimands (what quantities are being estimated?), **M**ethods (what estimation procedures are compared?), and **P**erformance measures (how is quality evaluated?). The framework serves as both a planning tool before coding begins and a reporting checklist when the study is written up. In this chapter we apply it systematically to @pustejovsky2022, producing a complete specification that will guide our reimplementation.
+
+@fig-workflow provides a bird's-eye view of how the five ADEMP components feed into each other and how they align with the DSR seven-step workflow that structures our reimplementation.
+
+```{mermaid}
+%%| label: fig-workflow
+%%| fig-cap: "The ADEMP framework applied to the P&T (2022) simulation study."
+%%| fig-width: 8
+flowchart TD
+  A["<b>A</b>ims<br/><i>Does CHE/SCE improve<br/>efficiency over CE?</i>"]
+  D["<b>D</b>ata-Generating Mechanisms<br/><i>CE, CHE, CMVE structures<br/>calibrated to TSL15</i>"]
+  E["<b>E</b>stimands<br/><i>Meta-regression coefficients,<br/>variance components, 95% CIs</i>"]
+  M["<b>M</b>ethods<br/><i>CE (robu), CHE (metafor),<br/>SCE (metafor)</i>"]
+  P["<b>P</b>erformance Measures<br/><i>Bias, RMSE, coverage,<br/>CI width, convergence</i>"]
+
+  A --> D --> E --> M --> P
+  P -.->|"Informs<br/>design"| A
+
+  style A fill:#4e79a7,color:#fff,stroke:#2d5f8a
+  style D fill:#59a14f,color:#fff,stroke:#3d7a35
+  style E fill:#f28e2b,color:#fff,stroke:#c47020
+  style M fill:#e15759,color:#fff,stroke:#b5393b
+  style P fill:#76b7b2,color:#fff,stroke:#4d918c
+```
+
+The diagram traces the logical flow: research questions (**A**) dictate the data-generating mechanisms (**D**), which define the target parameters (**E**), which are estimated by three methods (**M**), whose quality is assessed by a battery of performance measures (**P**). The dashed feedback arrow reflects the iterative nature of simulation design.
+
+
+## Aims {#sec-aims}
+
+The simulation in @pustejovsky2022 addresses four research questions:
+
+1. **Relative efficiency.** Does using the new CHE and SCE working models --- with REML estimation and fully inverse-variance weights --- yield more precise meta-regression coefficient estimates than the original CE working model with moment estimation and semi-efficient weights?
+
+2. **CI calibration.** Are 95% confidence intervals based on the new working models (using CR2 small-sample corrections) appropriately calibrated, even when the working model is misspecified relative to the true data-generating process?
+
+3. **Variance component accuracy.** How accurate are the REML variance component estimators from the new working models compared to the moment estimator from the CE working model?
+
+4. **Robustness to misspecification.** How do the working models perform when the assumed model structure or the assumed sampling correlation differs from the truth?
+
+The overarching claim is that combining multivariate/multilevel working models with cluster-robust variance estimation yields efficiency gains --- especially for within-study predictors --- without sacrificing inferential validity, even under model misspecification.
+
+
+## Data-Generating Mechanisms (Overview) {#sec-dgm-overview}
+
+The simulation generates synthetic meta-analytic datasets calibrated to the @tannersmiths2015 dataset (117 studies, 1,198 effect sizes). Rather than inventing parameter values, @pustejovsky2022 extract regression coefficients, variance components, and sample sizes from the real data and feed them into a parametric data-generating process. This "real-data calibration" strategy ensures the simulation operates in a realistic region of the parameter space.
+
+::: {.callout-note}
+## Real-data calibration
+The TSL15 calibration approach is detailed in @sec-tsl15-data. The key idea: fit the most complex model (CMVE) to the real data, extract the fitted parameters, and use those as truth in the simulation. This ensures the design factors span a plausible range rather than an arbitrary grid.
+:::
+
+### Three DGP structures
+
+True effect sizes are generated under one of three random effects structures, each corresponding to a different assumption about how effect sizes vary within and between studies.
+
+**DGP 1: Correlated Effects (CE).** All effect sizes within a study share a single study-level random effect:
+
+$$
+\delta_{ij} = \mathbf{x}_{ij}\boldsymbol{\beta} + u_j, \qquad u_j \sim N(0, \tau^2)
+$$ {#eq-dgp-ce}
+
+There is no within-study heterogeneity in true effects beyond what the covariates explain. In the code this corresponds to `struct = "CS"` with `omega = 0`.
+
+**DGP 2: Correlated-and-Hierarchical Effects (CHE).** Each effect size also receives its own random deviation:
+
+$$
+\delta_{ij} = \mathbf{x}_{ij}\boldsymbol{\beta} + u_j + v_{ij}, \qquad u_j \sim N(0, \tau^2), \quad v_{ij} \sim N(0, \omega^2)
+$$ {#eq-dgp-che}
+
+This adds within-study heterogeneity through $\omega^2$. In the code: `struct = "CS"` with `omega = 0.10`.
+
+**DGP 3: Correlated Multivariate Effects (CMVE).** Between-study variances differ by outcome category:
+
+$$
+\delta_{ij} = \mathbf{x}_{ij}\boldsymbol{\beta} + \sum_{c=1}^{C} d_{ij}^c \, u_{cj}, \qquad (u_{1j}, \ldots, u_{Cj}) \sim N(\mathbf{0}, \boldsymbol{\Psi})
+$$ {#eq-dgp-cmve}
+
+where $d_{ij}^c$ is an indicator for category $c$, $\text{Var}(u_{cj}) = \xi_c^2 \tau^2$, and $\text{Cov}(u_{bj}, u_{cj}) = \psi \, \xi_b \xi_c \tau^2$. The scaling parameters $\xi_c$ produce category-specific variances ranging from $0.5\tau^2$ to $2.0\tau^2$. In the code: `struct = "HCS"`.
+
+From these true effects, observed Hedges' $g$ values and their sampling variances are generated through a multivariate process involving Wishart-distributed pooled covariance matrices (see @sec-generate-smd for full details) and a study-resampling scheme from TSL15 (see @sec-generate-meta).
+
+
+## Estimands {#sec-estimands-overview}
+
+The simulation targets three families of estimands:
+
+**Meta-regression coefficients.** The vector $\boldsymbol{\beta} = (\beta_1, \ldots, \beta_p)'$ used to generate the true effects. For the `dvcat` specification, this includes six coefficients for outcome category indicators plus coefficients for follow-up time, proportion in college, proportion male, and attrition. Performance is evaluated primarily for the focal (within-study) predictor coefficients.
+
+**Variance components.** Between-study variance $\tau^2$ is a target for all three working models. Within-study variance $\omega^2$ is a target for the CHE working model. Category-specific between-study variances $\tau_c^2 = \xi_c^2 \tau^2$ are targets for the SCE model.
+
+**95% confidence intervals.** For each meta-regression coefficient $\beta_p$, constructed using CR2 robust variance estimation with Satterthwaite degrees of freedom. These intervals should achieve nominal 95% coverage regardless of working model misspecification.
+
+
+## Methods {#sec-methods-overview}
+
+Three estimation approaches are fitted to every simulated dataset. All three use the same assumed sampling correlation ($\rho = 0.6$) and apply CR2 robust inference via **clubSandwich** [@pustejovsky2020].
+
+```{r}
+#| label: tbl-methods
+#| tbl-cap: "Three estimation methods compared in the P&T (2022) simulation."
+#| code-fold: true
+#| code-summary: "Code: Methods comparison table"
+
+methods_tbl <- data.frame(
+  Label = c("CE", "CHE", "SCE"),
+  `Working model` = c(
+    "Correlated effects",
+    "Correlated-and-hierarchical effects",
+    "Subgroup correlated effects"
+  ),
+  Estimation = c(
+    "Method of moments (closed-form)",
+    "REML (iterative)",
+    "REML (iterative)"
+  ),
+  Weights = c(
+    "Semi-efficient (diagonal)",
+    "Fully inverse-variance",
+    "Fully inverse-variance"
+  ),
+  Implementation = c(
+    "Custom robu_handmade()",
+    "metafor::rma.mv()",
+    "metafor::rma.mv()"
+  ),
+  check.names = FALSE
+)
+
+knitr::kable(methods_tbl, align = "lllll")
+```
+
+**CE with moment estimation** uses the original @hedges2010 specification. The working model is $T_{ij} = \mathbf{x}_{ij}\boldsymbol{\beta} + u_j + e_{ij}$, with semi-efficient diagonal weights $w_{ij} = 1 / [n_j(\hat{\tau}^2 + \bar{s}_j^2)]$. The moment estimator for $\tau^2$ is closed-form and always converges.
+
+**CHE with REML** extends the CE model by adding effect-specific random deviations: $T_{ij} = \mathbf{x}_{ij}\boldsymbol{\beta} + u_j + v_{ij} + e_{ij}$, with $\text{Var}(u_j) = \tau^2$ and $\text{Var}(v_{ij}) = \omega^2$. Fitted via `metafor::rma.mv()` with `random = ~ 1 | studyID / esID`. Weights are the full inverse of the estimated marginal covariance matrix.
+
+**SCE with REML** allows category-specific between-study variances $\tau_c^2$ while assuming zero cross-category correlation. Fitted via `metafor::rma.mv()` with `random = ~ subgroup | studyID` and `struct = "DIAG"`. When convergence fails, the function falls back to initial per-category estimates.
+
+All methods apply CR2 bias-corrected robust variance estimation with Satterthwaite degrees of freedom for $t$-based confidence intervals. Full implementation details appear in @sec-estimation.
+
+
+## Performance Measures {#sec-performance-overview}
+
+```{r}
+#| label: tbl-performance
+#| tbl-cap: "Performance measures, definitions, and MCSE formulas for R replications."
+#| code-fold: true
+#| code-summary: "Code: Performance measures table"
+
+perf_tbl <- data.frame(
+  Metric = c(
+    "Bias",
+    "RMSE",
+    "Relative RMSE",
+    "Coverage",
+    "CI width",
+    "Convergence rate",
+    "Satterthwaite df"
+  ),
+  Definition = c(
+    "$\\frac{1}{R} \\sum_{r} (\\hat{\\theta}^{(r)} - \\theta)$",
+    "$\\sqrt{\\frac{1}{R} \\sum_{r} (\\hat{\\theta}^{(r)} - \\theta)^2}$",
+    "$\\text{RMSE}_{\\text{new}} \\,/\\, \\text{RMSE}_{\\text{CE}}$",
+    "$\\frac{1}{R} \\sum_{r} \\mathbf{1}(\\theta \\in \\text{CI}^{(r)})$",
+    "$\\frac{1}{R} \\sum_{r} (U^{(r)} - L^{(r)})$",
+    "$\\frac{1}{R} \\sum_{r} \\mathbf{1}(\\text{converged}^{(r)})$",
+    "Mean and SD of df across replications"
+  ),
+  `MCSE formula` = c(
+    "$\\text{SD}(\\hat{\\theta}) \\,/\\, \\sqrt{R}$",
+    "See Morris et al. (2019)",
+    "Delta method ratio",
+    "$\\sqrt{\\hat{c}(1 - \\hat{c}) / R}$",
+    "$\\text{SD}(\\text{width}) \\,/\\, \\sqrt{R}$",
+    "$\\sqrt{\\hat{p}(1 - \\hat{p}) / R}$",
+    "$\\text{SD}(\\text{df}) \\,/\\, \\sqrt{R}$"
+  ),
+  check.names = FALSE
+)
+
+knitr::kable(perf_tbl, align = "lll")
+```
+
+The primary presentation metric is **relative RMSE**: the ratio of RMSE under CHE or SCE to RMSE under CE. Values below 1 indicate efficiency gains from the new working model. Coverage is evaluated against the nominal 0.95 target. Variance component accuracy is assessed on the square-root scale.
+
+::: {.callout-note}
+## MCSEs: what P&T omitted and we will add
+@pustejovsky2022 do not report Monte Carlo standard errors for their performance metrics. When iteration-level data is available, **simhelpers** [@simhelpers] computes exact MCSEs for every metric. For the P&T pre-computed batch results used in later chapters, we compute **approximate** MCSEs derived from aggregated summaries (e.g., using RMSE as a proxy for the standard deviation of the estimator). The approximation is reasonable but not equivalent to what simhelpers would produce from raw iterations. Either way, including MCSEs lets us distinguish genuine differences from Monte Carlo noise --- an essential practice that @morris2019 strongly recommend.
+:::
+
+
+## The DSR Seven-Step Mapping {#sec-dsr-mapping}
+
+The DSR framework [@miratrixpustejovsky2024] organizes the simulation workflow into seven concrete steps. @tbl-dsr-mapping shows how each step maps onto the original P&T code and our **simhelpers**-based reimplementation.
+
+```{r}
+#| label: tbl-dsr-mapping
+#| tbl-cap: "Mapping the P&T (2022) simulation onto the DSR 7-step framework."
+#| code-fold: true
+#| code-summary: "Code: DSR mapping table"
+
+dsr_tbl <- data.frame(
+  Step = c(
+    "1. Generate",
+    "2. Analyze",
+    "3. Repeat",
+    "4. Summarize",
+    "5. Design",
+    "6. Execute",
+    "7. Synthesize"
+  ),
+  `P&T function` = c(
+    "generate_meta() -> generate_smd()",
+    "estimate_models() -> estimate_robu(), estimate_CHE(), estimate_MV()",
+    "map_dfr(1:iterations, ...) inside simulate_meta()",
+    "assess_performance() -- no MCSEs",
+    "expand.grid() + subset(struct == 'CS' | omega == 0)",
+    "plyr::mdply(params, simulate_meta, .parallel = TRUE)",
+    "Supplementary Rmd scripts"
+  ),
+  `simhelpers equivalent` = c(
+    "DGP function for bundle_sim()",
+    "Analyze function for bundle_sim()",
+    "repeat_and_stack() or bundled iteration",
+    "calc_absolute(), calc_relative(), calc_coverage()",
+    "tidyr::expand_grid() + filter()",
+    "evaluate_by_row(params, sim_driver)",
+    "ggplot2 + tidyverse pipelines"
+  ),
+  `Course chapter` = c(
+    "Ch 5--6",
+    "Ch 7",
+    "Ch 8",
+    "Ch 11",
+    "Ch 9",
+    "Ch 10",
+    "Ch 13--14"
+  ),
+  check.names = FALSE
+)
+
+knitr::kable(dsr_tbl, align = "llll")
+```
+
+::: {.callout-note}
+## Key architectural friction
+The original code wraps data generation and estimation inside a single `generate_estimate()` function that includes a rejection-sampling loop (resampling studies until the design matrix is full rank). This breaks the clean Generate/Analyze separation that **simhelpers** expects. In @sec-pipeline we discuss how to refactor this boundary.
+:::
+
+
+## Design Factor Table {#sec-design-factors}
+
+The simulation crosses six design factors with a filtering constraint that eliminates redundant conditions.
+
+```{r}
+#| label: tbl-design-factors
+#| tbl-cap: "Design factors, levels, and rationale for the P&T (2022) simulation."
+#| code-fold: true
+#| code-summary: "Code: Design factors table"
+
+design_tbl <- data.frame(
+  Factor = c(
+    "$J$ (n_studies)",
+    "struct",
+    "$\\tau$ (tau)",
+    "$\\omega$ (omega)",
+    "$\\bar{\\rho}$ (rho)",
+    "$\\nu$ (nu)"
+  ),
+  Levels = c(
+    "30, 60",
+    "CS, HCS",
+    "0.05, 0.10, 0.20",
+    "0.00, 0.10",
+    "0.2, 0.4, 0.6, 0.8",
+    "9 (fixed)"
+  ),
+  Meaning = c(
+    "Number of studies sampled from TSL15",
+    "CS = CE or CHE (compound symmetric); HCS = CMVE (heterogeneous)",
+    "Between-study SD of true effects",
+    "Within-study SD (only varies under CS struct)",
+    "Average within-study sampling correlation",
+    "Concentration parameter for Beta distribution of $\\rho_j$"
+  ),
+  Rationale = c(
+    "Spans typical small-to-moderate meta-analysis sizes",
+    "Tests performance under progressively complex DGPs",
+    "Ranges from small to large heterogeneity",
+    "Distinguishes CE (no within-study variation) from CHE",
+    "Tests sensitivity to assumed vs. true correlation",
+    "Controls study-to-study variability in $\\rho_j$"
+  ),
+  check.names = FALSE
+)
+
+knitr::kable(design_tbl, align = "llll")
+```
+
+**Filtering constraint.** The factors are not fully crossed. Because the CMVE structure (`struct = "HCS"`) has its own within-study heterogeneity mechanism (through category-specific variances $\xi_c^2 \tau^2$), the $\omega$ parameter is irrelevant. The constraint is:
+
+```r
+subset(params, struct == "CS" | omega == 0.00)
+```
+
+This produces three distinct DGPs from the combination of `struct` and `omega`:
+
+| struct | omega | DGP name | Description |
+|:-------|:------|:---------|:------------|
+| CS     | 0.00  | CE       | Correlated effects only |
+| CS     | 0.10  | CHE      | Correlated + hierarchical effects |
+| HCS    | 0.00  | CMVE     | Correlated multivariate effects |
+
+The full factorial would give $2 \times 2 \times 3 \times 2 \times 4 = 96$ conditions. Removing the 24 conditions where `struct = "HCS"` and `omega = 0.10` leaves **72 unique conditions** per model specification.
+
+
+## Number of Replications {#sec-replications}
+
+@pustejovsky2022 use $R = 4{,}012$ replications per condition, executed in 34 batches of 118 iterations each ($118 \times 34 = 4{,}012$). This is a generous replication count that yields tight MCSEs for the primary performance metrics.
+
+```{r}
+#| label: tbl-mcse-precision
+#| tbl-cap: "MCSE precision at R = 4,012 replications for key performance metrics."
+#| code-fold: true
+#| code-summary: "Code: MCSE precision table"
+
+R <- 4012
+
+mcse_tbl <- data.frame(
+  Metric = c(
+    "Bias",
+    "Coverage (at 0.95)",
+    "Coverage (at 0.90)",
+    "Convergence (at 0.99)"
+  ),
+  `MCSE formula` = c(
+    "$\\text{SD}(\\hat{\\theta}) / \\sqrt{R}$",
+    "$\\sqrt{0.95 \\times 0.05 / R}$",
+    "$\\sqrt{0.90 \\times 0.10 / R}$",
+    "$\\sqrt{0.99 \\times 0.01 / R}$"
+  ),
+  `Approximate MCSE` = c(
+    "Depends on SD; e.g., 0.0016 if SD = 0.10",
+    round(sqrt(0.95 * 0.05 / R), 4),
+    round(sqrt(0.90 * 0.10 / R), 4),
+    round(sqrt(0.99 * 0.01 / R), 4)
+  ),
+  Interpretation = c(
+    "Bias estimates precise to ~0.002 for typical SDs",
+    "Coverage rates precise to ~0.3 percentage points",
+    "Coverage rates precise to ~0.5 percentage points",
+    "Convergence rates precise to ~0.2 percentage points"
+  ),
+  check.names = FALSE
+)
+
+knitr::kable(mcse_tbl, align = "llll")
+```
+
+With $R = 4{,}012$, coverage rates are estimated with an MCSE of approximately 0.003 (0.3 percentage points). This means if we observe a coverage rate of 0.940, the 95% Monte Carlo confidence interval is roughly $[0.934, 0.946]$ --- tight enough to distinguish meaningfully under-covering intervals from nominal ones. When we compare our replication results to P&T's originals in @sec-verification, this precision determines the tolerance band for declaring a match.
+
+::: {.callout-note}
+## Total simulation runs
+With 72 conditions $\times$ 4,012 replications $\times$ 3 estimation methods per replication, the simulation produces $72 \times 4{,}012 = 288{,}864$ simulated datasets, each analyzed three times, yielding 866,592 model fits for the `dvcat` specification alone. The `Ctype` specification adds a comparable number. This is a large simulation by meta-analytic standards.
+:::
+
+
+## What Lies Ahead {#sec-ahead}
+
+This ADEMP decomposition provides the complete specification. The remaining chapters implement each component:
+
+- **@sec-tsl15-data** explores the real TSL15 dataset that calibrates the simulation.
+- **@sec-models** develops the mathematical details of the HE, CE, CHE, and SCE working models.
+- **@sec-generate-smd** and **@sec-generate-meta** build the data-generating process, from correlated Hedges' $g$ values within a single study to complete meta-analytic datasets under each DGP.
+- **@sec-estimation** implements the three estimation methods with convergence handling.
+- **@sec-design** formalizes the factorial design and computes MCSE-driven replication counts.
+- **@sec-execution** runs the full simulation with parallel execution and seed management.
+
+With the blueprint in hand, we begin in the next chapter by examining the empirical foundation: the @tannersmiths2015 dataset from which the simulation draws its structure.

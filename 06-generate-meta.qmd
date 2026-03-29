@@ -1,0 +1,538 @@
+# Generating Meta-Analytic Datasets: `generate_meta()` {#sec-generate-meta}
+
+```{r}
+#| label: setup-meta
+#| include: false
+source("_common.R")
+library(mvtnorm)
+```
+
+```{r}
+#| label: source-functions
+#| include: false
+source("R/simulation-functions.R")
+```
+
+In the previous chapter we saw how `generate_smd()` produces effect size estimates for a single study (@sec-generate-smd). But a meta-analysis contains many studies, each with its own sample size, true effects, and within-study correlation. The function `generate_meta()` is the orchestrator that assembles a complete meta-analytic dataset. It takes a full design specification --- covariates, study identifiers, true parameter values, and a random effects structure --- and returns one simulated dataset ready for analysis.
+
+This chapter walks through `generate_meta()` in detail: its arguments, the four steps it performs internally, and how those steps map onto the data-generating processes described by @pustejovsky2022.
+
+
+## Overview {#sec-overview}
+
+At the highest level, `generate_meta()` does four things:
+
+1. **Builds true effect sizes** from a meta-regression model with study-level (and possibly within-study) random effects.
+2. **Draws sampling correlations** from a Beta distribution so that each study gets its own within-study correlation $\rho_j$.
+3. **Calls `generate_smd()`** for each study to convert true effects into observed Hedges' $g$ values and sampling variances.
+4. **Assembles the output** by joining the generated effect sizes back to the covariate matrix.
+
+The function does *not* handle study sampling from the TSL15 data --- that happens upstream in the simulation driver (covered in a later chapter). Instead, `generate_meta()` receives the already-sampled covariate matrix and study identifiers as inputs. This separation of concerns keeps the data-generating logic clean and testable.
+
+
+## Function arguments {#sec-arguments}
+
+```{r}
+#| label: generate-meta-code
+#| eval: false
+#| code-fold: true
+#| code-summary: "Full generate_meta() function"
+generate_meta <- function(covariates,
+                          studyID,
+                          subgroup = NULL,
+                          sample_sizes = pmin(20 + 2 * rpois(length(unique(studyID)), 20), 200),
+                          beta = rep(0, ncol(covariates)),
+                          tau = 0, omega = 0, rho = 0.6, nu = 50,
+                          tau_covariate = NULL, tau_corr = NULL, tau_scalar = 1,
+                          return_study_params = FALSE,
+                          seed = NULL) {
+
+  if (!is.null(seed)) set.seed(seed)
+
+  studyID_vec <- levels(studyID)
+  n_studies <- length(studyID_vec)
+  n_ES_total <- nrow(covariates)
+
+  if (is.null(tau_covariate) | is.null(tau_corr)) {
+    v_j <- rnorm(n_studies, 0, tau)[studyID]
+  } else {
+    tau_covariate <- as.factor(tau_covariate)
+    tau_dim <- nlevels(tau_covariate)
+    tau_scaled <- tau * rep(tau_scalar, length.out = tau_dim)
+    Sigma_tau <- tcrossprod(tau_scaled) * (tau_corr + diag(1 - tau_corr, nrow = tau_dim))
+    v_j <- rmvnorm(n_studies, mean = rep(0, tau_dim), sigma = Sigma_tau)
+    z_j <- split(tau_covariate, studyID)
+    v_list <- list()
+    for (j in 1:n_studies) {
+      v_list[[j]] <- v_j[j,][z_j[[j]]]
+    }
+    v_j <- unsplit(v_list, studyID)
+  }
+
+  u_ij <- rnorm(n_ES_total, 0, omega)
+  Xbeta <- as.numeric(covariates %*% beta)
+
+  study_data <-
+    tibble(
+      delta = Xbeta + v_j + u_ij,
+      studyID = studyID
+    ) %>%
+    group_by(studyID) %>%
+    summarize(
+      delta = list(delta),
+      k = n(),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      N = sample_sizes[studyID_vec],
+      Sigma = rbeta(n_studies, rho * nu, (1 - rho) * nu)
+    )
+
+  if (return_study_params) return(study_data)
+
+  X_data <-
+    as.data.frame(covariates) %>%
+    mutate(
+      studyID = studyID,
+      esID = 1:n_ES_total,
+      subgroup = subgroup
+    ) %>%
+    group_nest(studyID, .key = "X")
+
+  meta_reg_dat <-
+    study_data %>%
+    mutate(
+      smds = pmap(select(., -studyID), generate_smd)
+    ) %>%
+    left_join(X_data, by = "studyID") %>%
+    select(-delta, -k, -N, -Sigma) %>%
+    unnest(cols = c(smds, X))
+
+  return(meta_reg_dat)
+}
+```
+
+The arguments fall into three groups: data inputs from TSL15, true parameters for the DGP, and structural controls.
+
+| Argument | Type | Description |
+|:---------|:-----|:------------|
+| `covariates` | matrix | Design matrix $\mathbf{X}$ with one row per effect size and one column per predictor. Drawn from the TSL15 data. |
+| `studyID` | factor | Study membership for each row of `covariates`. Must be a factor whose levels define the set of studies. |
+| `subgroup` | factor | Category indicator for each effect size (e.g., type of dependent variable). Used for SCE models; `NULL` if not needed. |
+| `sample_sizes` | named vector | Total sample size $N_j$ for each study, indexed by study ID. Default generates random sizes, but the simulation uses TSL15 values. |
+| `beta` | numeric | True meta-regression coefficient vector $\boldsymbol{\beta}$. Length must match `ncol(covariates)`. |
+| `tau` | numeric | Between-study standard deviation $\tau$. |
+| `omega` | numeric | Within-study standard deviation $\omega$ (for CHE structure). |
+| `rho` | numeric | Mean within-study sampling correlation $\bar{\rho}$. |
+| `nu` | numeric | Concentration parameter $\nu$ for the Beta distribution of $\rho_j$. |
+| `tau_covariate` | factor | Category indicator for CMVE random effects (which category does each effect size belong to?). |
+| `tau_corr` | numeric | Correlation $\psi$ between category-specific random effects in the CMVE structure. |
+| `tau_scalar` | numeric | Vector of scaling factors $\boldsymbol{\xi}$ for category-specific variances in the CMVE structure. |
+
+: Arguments to `generate_meta()` {#tbl-generate-meta-args}
+
+::: {.callout-note}
+## Empirical inputs, not scalars
+Unlike many simulation DGPs where every argument is a simple scalar, `generate_meta()` requires matrix and factor inputs (`covariates`, `studyID`, `sample_sizes`) drawn from real data. This is a deliberate design choice by @pustejovsky2022: the simulation is *calibrated* to the empirical structure of the Tanner-Smith and Lipsey (2015) dataset, not to an idealized parametric design. It is also a source of architectural friction when trying to fit the function into a framework like @simhelpers, as we discuss at the end of this chapter.
+:::
+
+
+## Step 1: Building the meta-regression component {#sec-step1-regression}
+
+The first operation inside `generate_meta()` computes the systematic part of each true effect size --- the meta-regression $\mathbf{x}_{ij}\boldsymbol{\beta}$:
+
+```r
+Xbeta <- as.numeric(covariates %*% beta)
+```
+
+This is straightforward matrix multiplication. With 1,179 rows in the full TSL15 covariate matrix and 11 predictors, `Xbeta` is a vector of 1,179 predicted values. Each value represents the expected true effect size for that particular combination of DV category, follow-up time, sample composition, and attrition level.
+
+But the true effects are not simply $\mathbf{x}_{ij}\boldsymbol{\beta}$. They also include random effects that capture study-to-study (and possibly within-study) variation. This is where the three DGP structures diverge.
+
+
+## Step 2: Generating random effects {#sec-step2-random-effects}
+
+The `struct` parameter in the simulation design determines which random effects structure is used. Inside `generate_meta()`, this is controlled by whether `tau_covariate` and `tau_corr` are supplied.
+
+### Structure 1: Correlated Effects (CE) {#sec-ce}
+
+When `tau_covariate` and `tau_corr` are both `NULL`, the function generates a simple random intercept at the study level:
+
+$$
+\delta_{ij} = \mathbf{x}_{ij}\boldsymbol{\beta} + u_j, \qquad u_j \sim N(0, \tau^2)
+$$ {#eq-ce}
+
+In the code:
+
+```r
+v_j <- rnorm(n_studies, 0, tau)[studyID]
+```
+
+This draws one random effect per study from $N(0, \tau^2)$, then expands the vector to match the full effect-size-level data by indexing with `studyID`. If study $j$ contributes 5 effect sizes, all 5 share the same $u_j$.
+
+The within-study random effect is also generated:
+
+```r
+u_ij <- rnorm(n_ES_total, 0, omega)
+```
+
+Under CE, `omega = 0`, so these are all zeros. The true effect sizes become:
+
+$$
+\delta_{ij} = \mathbf{x}_{ij}\boldsymbol{\beta} + u_j
+$$
+
+All effect sizes within a study deviate from the regression prediction by the same amount $u_j$.
+
+### Structure 2: Correlated-and-Hierarchical Effects (CHE) {#sec-che}
+
+Under CHE, `omega > 0` (specifically, $\omega = 0.10$ in the simulation), adding a within-study random effect:
+
+$$
+\delta_{ij} = \mathbf{x}_{ij}\boldsymbol{\beta} + u_j + v_{ij}, \qquad u_j \sim N(0, \tau^2), \quad v_{ij} \sim N(0, \omega^2)
+$$ {#eq-che}
+
+The code is identical to CE except that `omega` is nonzero, so `u_ij <- rnorm(n_ES_total, 0, omega)` now contributes real variation. Each effect size within a study gets its own independent deviation $v_{ij}$ on top of the shared study effect $u_j$.
+
+### Structure 3: Correlated Multivariate Effects (CMVE) {#sec-cmve}
+
+The CMVE structure is the most complex. Instead of a single study-level random effect, each DV category $c$ gets its own random effect, and these are correlated across categories:
+
+$$
+\delta_{ij} = \mathbf{x}_{ij}\boldsymbol{\beta} + \sum_{c=1}^{C} d_{ij}^c \, u_{cj}
+$$ {#eq-cmve}
+
+where $d_{ij}^c$ is an indicator for whether effect size $i$ in study $j$ belongs to category $c$, and the random effects vector $(u_{1j}, \ldots, u_{Cj})'$ is multivariate normal with:
+
+$$
+\text{Var}(u_{cj}) = \xi_c^2 \tau^2, \qquad \text{Cov}(u_{bj}, u_{cj}) = \psi \, \xi_b \xi_c \tau^2
+$$
+
+This is a heterogeneous compound-symmetric covariance structure: each category has its own variance (scaled by $\xi_c$), but all pairs share the same correlation $\psi$.
+
+The code builds this in several steps:
+
+```r
+tau_covariate <- as.factor(tau_covariate)
+tau_dim <- nlevels(tau_covariate)
+tau_scaled <- tau * rep(tau_scalar, length.out = tau_dim)
+Sigma_tau <- tcrossprod(tau_scaled) * (tau_corr + diag(1 - tau_corr, nrow = tau_dim))
+```
+
+The line `tcrossprod(tau_scaled)` creates a $C \times C$ matrix whose $(b,c)$ entry is $\xi_b \tau \times \xi_c \tau$. Multiplying elementwise by `(tau_corr + diag(1 - tau_corr, ...))` sets off-diagonal entries to $\psi \xi_b \xi_c \tau^2$ and diagonal entries to $\xi_c^2 \tau^2$. This is the covariance matrix $\boldsymbol{\Sigma}_\tau$.
+
+Then, multivariate normal draws are generated and mapped back to individual effect sizes:
+
+```r
+v_j <- rmvnorm(n_studies, mean = rep(0, tau_dim), sigma = Sigma_tau)
+z_j <- split(tau_covariate, studyID)
+v_list <- list()
+for (j in 1:n_studies) {
+  v_list[[j]] <- v_j[j,][z_j[[j]]]
+}
+v_j <- unsplit(v_list, studyID)
+```
+
+Each study gets a draw of $C$ random effects (one per category). The loop assigns the appropriate random effect to each effect size based on its category membership. If effect size $i$ in study $j$ belongs to the "heavy use" category, it gets the "heavy use" component of study $j$'s random effect vector.
+
+::: {.callout-tip}
+## Linking `struct` to code parameters
+The simulation design uses `struct = "CS"` for both CE and CHE (the difference being `omega`), and `struct = "HCS"` for CMVE. Inside `generate_meta()`, the branching happens via the `tau_covariate`/`tau_corr` arguments: when they are `NULL`, the function uses the CE/CHE path; when they are supplied, it uses the CMVE path. The `struct` variable in the design grid controls which set of arguments is passed.
+:::
+
+
+## Step 3: Generating sampling correlations {#sec-step3-correlations}
+
+Each study needs a within-study sampling correlation $\rho_j$ for the equi-correlation matrix used by `generate_smd()`. Rather than using a constant $\rho$ for every study, the simulation draws study-specific correlations from a Beta distribution:
+
+$$
+\rho_j \sim \text{Beta}(\bar{\rho} \cdot \nu, \; (1 - \bar{\rho}) \cdot \nu)
+$$ {#eq-rho-beta}
+
+In the code, this appears inside the `mutate()` call that builds `study_data`:
+
+```r
+Sigma = rbeta(n_studies, rho * nu, (1 - rho) * nu)
+```
+
+The Beta distribution is parameterized so that $E[\rho_j] = \bar{\rho}$ and $\text{SD}(\rho_j) = \sqrt{\bar{\rho}(1-\bar{\rho}) / (\nu + 1)}$. With $\nu = 9$ (the value used in the simulation), the standard deviation ranges from about 0.13 to 0.15 depending on $\bar{\rho}$.
+
+::: {.callout-note}
+## Why not a constant $\rho$?
+In real meta-analyses, the within-study correlation between outcomes varies from study to study. Some studies measure outcomes that are more tightly related; others measure more distinct constructs. Using a constant $\rho$ would make the simulation unrealistically homogeneous. The Beta distribution adds study-to-study variation while keeping the average correlation at $\bar{\rho}$, and the concentration parameter $\nu$ controls how much spread there is around that average.
+:::
+
+Let us visualize the distribution for $\bar{\rho} = 0.6$ and $\nu = 9$:
+
+```{r}
+#| label: fig-beta-rho
+#| fig-cap: "Distribution of study-specific sampling correlations under the Beta model with mean 0.6 and concentration 9."
+#| fig-width: 7
+#| fig-height: 4
+set.seed(42)
+rho_draws <- rbeta(5000, 0.6 * 9, (1 - 0.6) * 9)
+
+ggplot(data.frame(rho = rho_draws), aes(x = rho)) +
+  geom_histogram(bins = 40, fill = "steelblue", alpha = 0.7) +
+  labs(x = expression(rho[j]), y = "Count",
+       title = expression(rho[j] %~% Beta(5.4, 3.6))) +
+  theme_minimal(base_size = 13)
+```
+
+The distribution is centered near 0.6 but with substantial spread --- some studies have correlations below 0.3 while others exceed 0.9.
+
+```{r}
+#| label: fig-beta-comparison
+#| fig-cap: "Beta distributions for within-study correlation at four levels of the mean correlation."
+#| fig-width: 8
+#| fig-height: 4
+
+nu <- 9
+rho_bars <- c(0.2, 0.4, 0.6, 0.8)
+x_seq <- seq(0, 1, length.out = 300)
+
+beta_curves <- do.call(rbind, lapply(rho_bars, function(rb) {
+  data.frame(
+    x = x_seq,
+    density = dbeta(x_seq, rb * nu, (1 - rb) * nu),
+    rho_bar = paste0("bar(rho) == ", rb)
+  )
+}))
+
+ggplot(beta_curves, aes(x = x, y = density, fill = rho_bar)) +
+  geom_area(alpha = 0.5) +
+  geom_vline(data = data.frame(rho_bar = paste0("bar(rho) == ", rho_bars), xint = rho_bars),
+             aes(xintercept = xint), linetype = "dashed", color = "grey40") +
+  facet_wrap(~ rho_bar, labeller = label_parsed, nrow = 1) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(x = expression(rho[j]), y = "Density") +
+  theme(legend.position = "none")
+```
+
+Each panel shows the Beta distribution centered at its mean, with dashed lines marking the population mean. The spread is governed by the concentration parameter $\nu = 9$.
+
+
+## Step 4: Generating observed effect sizes {#sec-step4-observed}
+
+With the true effects $\boldsymbol{\delta}_j$, sample sizes $N_j$, and sampling correlations $\rho_j$ assembled into `study_data`, the function calls `generate_smd()` for each study using `pmap()`:
+
+```r
+study_data %>%
+  mutate(
+    smds = pmap(select(., -studyID), generate_smd)
+  )
+```
+
+The `pmap()` call iterates over rows of `study_data`, passing each row's `delta`, `k`, `N`, and `Sigma` columns to `generate_smd()`. Each call returns a tibble with columns `g` and `var_g` --- the observed Hedges' $g$ values and their sampling variances for one study.
+
+The final assembly step packages the covariate matrix into a nested tibble `X_data` (one list-column per study), joins it to `study_data` by `studyID`, and `unnest()`s both the generated SMDs and the covariates. The result is a single flat tibble where each row is one effect size, with columns for `g`, `var_g`, all covariates, `studyID`, `esID`, and `subgroup` --- a complete meta-analytic dataset ready for the estimation functions.
+
+
+## Execution flow summary {#sec-walkthrough}
+
+Putting the steps together, the function's execution flow is:
+
+1. Extract study labels and dimensions (`studyID_vec`, `n_studies`, `n_ES_total`).
+2. Branch on `tau_covariate`/`tau_corr` to generate CE/CHE or CMVE random effects.
+3. Compute `Xbeta + v_j + u_ij` at the effect-size level, then group by study into list-columns.
+4. Draw sample sizes and sampling correlations to complete `study_data` (one row per study).
+5. Optionally return `study_data` early if `return_study_params = TRUE` --- useful for debugging the true parameter values before adding sampling noise.
+6. Call `generate_smd()` via `pmap()`, join back covariate data, and return the full dataset.
+
+
+## Hands-on exercise {#sec-exercise}
+
+Let us generate one meta-analytic dataset under each of the three DGP structures, using the actual TSL15 parameters.
+
+```{r}
+#| label: load-tsl15
+load("data/dv-model-data.Rdata")
+```
+
+The loaded objects include `covariates` (the $1179 \times 11$ design matrix), `studyID` (a factor with 117 levels), `beta` (the 11-element coefficient vector), `sample_sizes`, `subgroup`, `tau_covariate`, `tau_corr`, and `tau_scalar`.
+
+### CE dataset (no within-study heterogeneity)
+
+```{r}
+#| label: generate-ce
+set.seed(20240701)
+
+dat_ce <- generate_meta(
+  covariates = covariates,
+  studyID = studyID,
+  subgroup = subgroup,
+  sample_sizes = sample_sizes,
+  beta = beta,
+  tau = 0.10, omega = 0,
+  rho = 0.6, nu = 9
+)
+
+dim(dat_ce)
+names(dat_ce)
+```
+
+### CHE dataset (with within-study heterogeneity)
+
+```{r}
+#| label: generate-che
+set.seed(20240701)
+
+dat_che <- generate_meta(
+  covariates = covariates,
+  studyID = studyID,
+  subgroup = subgroup,
+  sample_sizes = sample_sizes,
+  beta = beta,
+  tau = 0.10, omega = 0.10,
+  rho = 0.6, nu = 9
+)
+
+dim(dat_che)
+```
+
+### CMVE dataset (category-specific random effects)
+
+```{r}
+#| label: generate-cmve
+set.seed(20240701)
+
+dat_cmve <- generate_meta(
+  covariates = covariates,
+  studyID = studyID,
+  subgroup = subgroup,
+  sample_sizes = sample_sizes,
+  beta = beta,
+  tau = 0.10, omega = 0,
+  rho = 0.6, nu = 9,
+  tau_covariate = tau_covariate,
+  tau_corr = tau_corr,
+  tau_scalar = tau_scalar
+)
+
+dim(dat_cmve)
+```
+
+### Comparing the three datasets
+
+```{r}
+#| label: tbl-compare-dgp
+#| tbl-cap: "Summary statistics for one dataset generated under each DGP structure."
+bind_rows(
+  CE   = summarize(dat_ce,  mean_g = mean(g), sd_g = sd(g), mean_var = mean(var_g)),
+  CHE  = summarize(dat_che, mean_g = mean(g), sd_g = sd(g), mean_var = mean(var_g)),
+  CMVE = summarize(dat_cmve, mean_g = mean(g), sd_g = sd(g), mean_var = mean(var_g)),
+  .id = "DGP"
+) |>
+  knitr::kable(digits = 4)
+```
+
+The CHE dataset should show slightly more variability in `g` than the CE dataset (due to the additional $\omega^2$ component), while the CMVE dataset has category-specific variance that may increase or decrease variability depending on the scaling factors $\boldsymbol{\xi}$.
+
+
+## Restructuring with simhelpers {#sec-simhelpers}
+
+The @simhelpers package structures simulations around a clean `generate -> analyze -> summarize` pipeline via `bundle_sim()`. How would `generate_meta()` fit into this framework?
+
+::: {.panel-tabset}
+#### simhelpers
+
+A `bundle_sim()`-compatible wrapper captures the fixed empirical inputs in a closure and exposes only the varying simulation parameters:
+
+```{r}
+#| label: simhelpers-wrapper
+#| eval: false
+generate_meta_sim <- function(n_studies, tau, omega, rho, nu = 9,
+                              struct = "CS", seed = NULL) {
+
+  # --- Empirical inputs captured from environment ---
+  # covariates, studyID, subgroup, sample_sizes, beta,
+  # tau_covariate, tau_corr, tau_scalar
+  # are loaded from dv-model-data.Rdata in the enclosing scope
+
+  if (struct == "HCS") {
+    tc  <- tau_covariate
+    tcr <- tau_corr
+    ts  <- tau_scalar
+  } else {
+    tc  <- NULL
+    tcr <- NULL
+    ts  <- 1
+  }
+
+  dat <- generate_meta(
+    covariates = covariates,
+    studyID = studyID,
+    subgroup = subgroup,
+    sample_sizes = sample_sizes,
+    beta = beta,
+    tau = tau, omega = omega,
+    rho = rho, nu = nu,
+    tau_covariate = tc,
+    tau_corr = tcr,
+    tau_scalar = ts,
+    seed = seed
+  )
+
+  return(dat)
+}
+```
+
+#### Original P&T
+
+In @pustejovsky2022, `generate_meta()` is called directly inside the `generate_estimate()` function, which also handles study sampling:
+
+```{r}
+#| label: original-call
+#| eval: false
+meta_data <- generate_meta(
+  covariates = X_sub,
+  studyID = studyID_sub,
+  subgroup = subgroup_sub,
+  sample_sizes = sample_sizes,
+  beta = beta,
+  tau = tau, omega = omega,
+  rho = rho, nu = nu,
+  tau_covariate = tau_covariate,
+  tau_corr = tau_corr,
+  tau_scalar = tau_scalar
+)
+```
+
+Here `X_sub`, `studyID_sub`, and `subgroup_sub` are the *already-sampled* subsets from the TSL15 data, produced by the rejection-sampling loop in `generate_estimate()`.
+:::
+
+::: {.callout-important}
+## The architectural friction
+The core difficulty in adapting this simulation to `bundle_sim()` is that the design matrix is not a simple scalar parameter that can appear as a row in `expand_grid()`. The covariate matrix, study identifiers, and sample sizes are large, structured objects that must be passed alongside the varying design factors ($\tau$, $\omega$, $\rho$, etc.). The wrapper function above handles this by capturing the empirical inputs from the enclosing environment, but this creates an implicit dependency that is less transparent than the explicit argument-passing style of the original code. This is a genuine trade-off between the flexibility of an empirically calibrated simulation and the clean modularity of a framework like @simhelpers.
+:::
+
+
+## Summary {#sec-summary}
+
+`generate_meta()` is the main data-generating function in the @pustejovsky2022 simulation. It translates a complete parameter specification into one meta-analytic dataset through four steps:
+
+1. **Random effects generation** under the CE (@eq-ce), CHE (@eq-che), or CMVE (@eq-cmve) structure.
+2. **Meta-regression** combining $\mathbf{X}\boldsymbol{\beta}$ with the random effects to produce true effect sizes $\boldsymbol{\delta}$.
+3. **Sampling correlation draws** from a Beta distribution (@eq-rho-beta) to introduce study-to-study variation in within-study dependence.
+4. **Observed effect sizes** via `generate_smd()` calls for each study, producing the $(g_{ij}, V_{ij})$ pairs that estimation methods will analyze.
+
+In the next chapter, we turn to those estimation methods --- the `estimate_models()` function and its three working-model implementations.
+
+
+## Exercises {.unnumbered}
+
+::: {.callout-caution title="Exercise 6.1: Generating under different parameters"}
+Generate a meta-analytic dataset with `n_studies = 30`, `tau = 0.20`, `omega = 0.10`, `rho = 0.4` using the dvcat parameters. Compare the distribution of effect sizes to the dataset generated with `tau = 0.05` in the chapter. What happens to the spread of effect sizes as $\tau$ increases?
+
+::: {.callout-tip title="Hint" collapse="true"}
+Load `data/dv-model-data.Rdata` and call `generate_meta()` with the specified parameters. Use `ggplot() + geom_density()` to compare distributions. A strong answer would show overlapping density plots for the two tau values and note that higher tau produces wider spread in effect sizes.
+:::
+:::
+
+::: {.callout-caution title="Exercise 6.2: CMVE structure"}
+In the CMVE data-generating process, the scaling parameters $\xi_c$ produce category-specific variances ranging from $0.5\tau^2$ to $2.0\tau^2$. What would happen if all $\xi_c = 1$ (i.e., equal variance across categories)? How would this relate to the CHE model?
+
+::: {.callout-tip title="Hint" collapse="true"}
+When all $\xi_c = 1$ and $\psi = 0$, the CMVE model reduces to independent CE models per subgroup. When $\psi = 1$, all categories share the same random effect, recovering the CHE structure.
+:::
+:::

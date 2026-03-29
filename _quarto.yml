@@ -1,0 +1,52 @@
+project:
+  type: book
+  output-dir: _book
+
+book:
+  title: "Replicating a Simulation Study"
+  subtitle: "A Case Study with Pustejovsky & Tipton (2022)"
+  author: "JoonHo Lee"
+  date: today
+  chapters:
+    - index.qmd
+    - part: "Context and Foundations"
+      chapters:
+        - 01-introduction.qmd
+        - 02-ademp-blueprint.qmd
+        - 03-tsl15-data.qmd
+    - part: "The Data-Generating Process"
+      chapters:
+        - 04-working-models.qmd
+        - 05-generate-smd.qmd
+        - 06-generate-meta.qmd
+    - part: "Estimation"
+      chapters:
+        - 07-estimation.qmd
+        - 08-pipeline.qmd
+    - part: "Execution and Design"
+      chapters:
+        - 09-factorial-design.qmd
+        - 10-execution.qmd
+    - part: "Analysis and Reporting"
+      chapters:
+        - 11-performance-metrics.qmd
+        - 12-verification.qmd
+        - 13-visualization.qmd
+        - 14-reporting.qmd
+    - part: "Appendices"
+      chapters:
+        - appendix-a-real-data.qmd
+        - appendix-b-math.qmd
+        - appendix-c-software.qmd
+    - references.qmd
+
+bibliography: references.bib
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+    number-sections: true
+    code-fold: show
+    code-tools: true
+    highlight-style: github

@@ -1,0 +1,55 @@
+# Preface {.unnumbered}
+
+```{r}
+#| label: setup-index
+#| include: false
+source("_common.R")
+```
+
+Welcome to *Replicating a Simulation Study*, a mini course that guides you through a complete, hands-on replication of a published Monte Carlo simulation study. This is the second course in the SimSum series, following [Performance Metrics for Simulation Studies](https://joonho112.github.io/simsum-mini-course/).
+
+## Why replication?
+
+The best way to learn simulation methodology is to do it. Reading about bias, coverage, and Monte Carlo standard errors provides the foundation, but actually implementing a data-generating process, running thousands of iterations, and analyzing the results builds genuine competence.
+
+In this course, we replicate the simulation study from @pustejovsky2022 --- *Meta-Analysis with Robust Variance Estimation: Expanding the Range of Working Models*. This paper proposes new working models (CHE and SCE) for meta-analysis with dependent effect sizes and evaluates them through a carefully designed simulation calibrated to real data.
+
+## Why this paper?
+
+Pustejovsky and Tipton (2022) is an ideal learning vehicle for several reasons:
+
+1. **Open Science exemplar.** All code, data, and results are publicly available on the [Open Science Framework](https://osf.io/x8yre/). This transparency enables exact replication and allows us to verify our work at every step.
+
+2. **Real-data-driven design.** The simulation draws its parameters from the Tanner-Smith and Lipsey (2015) meta-analysis of brief alcohol interventions --- a model of externally valid simulation design.
+
+3. **Methodological relevance.** Dependent effect sizes are ubiquitous in education, prevention science, and the social sciences. The methods evaluated in this paper are now widely adopted.
+
+4. **Manageable complexity.** The factorial design is tractable for a course while being genuinely research-grade.
+
+## What you will learn
+
+By the end of this course, you will be able to:
+
+- Navigate and understand the complete codebase of a published simulation study
+- Design a simulation whose parameters are calibrated to real empirical data
+- Implement data-generating processes for meta-analytic data with dependent effect sizes
+- Structure simulation code following the framework of @miratrixpustejovsky2024
+- Compute and interpret all standard performance metrics using `simhelpers` and `rsimsum`
+- Reproduce the key findings of P&T (2022) and verify them against published results
+- Report simulation results following best practices [@morris2019]
+
+## Software
+
+We primarily use the `simhelpers` R package [@simhelpers] for structuring simulations and computing performance metrics, shown alongside `rsimsum` [@gasparini2018] for comparison. The estimation functions rely on `metafor` [@viechtbauer2010], `clubSandwich` [@pustejovsky2020], and `robumeta` [@fisher2017].
+
+## Prerequisites
+
+This course assumes familiarity with:
+
+- Performance metrics and Monte Carlo standard errors (covered in [Mini Course 1](https://joonho112.github.io/simsum-mini-course/))
+- Basic R programming and the tidyverse
+- Conceptual understanding of meta-analysis (effect sizes, heterogeneity, random effects models)
+
+## Acknowledgments
+
+This course is built on the foundational work of @pustejovsky2022, the simulation design framework of @miratrixpustejovsky2024, and the performance metrics framework of @morris2019.

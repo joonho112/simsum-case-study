@@ -1,0 +1,23 @@
+# Quarto build output
+_book/
+.quarto/
+*_files/
+_freeze/
+
+# R artifacts
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*~
+.vscode/
+
+# Internal development files
+_internal/

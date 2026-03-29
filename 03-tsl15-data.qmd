@@ -1,0 +1,475 @@
+# The Empirical Foundation: Tanner-Smith & Lipsey (2015) {#sec-tsl15-data}
+
+```{r}
+#| label: setup-tsl15
+#| include: false
+source("_common.R")
+```
+
+A simulation study is only as convincing as its data-generating mechanism. If you choose parameter values out of thin air --- "let $\tau^2 = 0.1$ because it seems reasonable" --- reviewers and readers will rightfully ask whether your conclusions generalize to real meta-analyses. @pustejovsky2022 sidestep this problem by *calibrating* every aspect of their simulation to a real dataset: the @tannersmiths2015 meta-analysis of brief alcohol interventions. This chapter explores that dataset in depth, then traces exactly how @pustejovsky2022 extract the parameters that drive the simulation.
+
+
+## The Tanner-Smith & Lipsey (2015) meta-analysis {#sec-tsl15-overview}
+
+@tannersmiths2015 synthesized research on brief alcohol interventions for adolescents and young adults, published in the *Journal of Substance Abuse Treatment*. The dataset contains 1,198 effect sizes (Hedges' $g$) nested within 117 studies, after excluding observations with missing covariates. Key features that make this dataset ideal for studying robust variance estimation include:
+
+- **Multiple effect sizes per study.** Most studies contribute many outcomes measured at different follow-up times, creating the dependent-effects structure that RVE is designed to handle.
+- **A within-study categorical predictor.** The type of dependent variable (`dv_cat`) varies *within* studies, with six categories spanning different ways of measuring alcohol consumption.
+- **A between-study categorical predictor.** The type of control group (`Ctype`) varies *between* studies, with four categories reflecting different comparison conditions.
+- **Continuous covariates.** Follow-up time, sample composition, and attrition vary across effect sizes and studies.
+
+This mix of within-study and between-study predictors is precisely what the @pustejovsky2022 simulation is designed to stress-test.
+
+
+## Loading and exploring the data {#sec-load-data}
+
+```{r}
+#| label: load-tsl15
+TSL15 <- readRDS("data/Tanner-Smith-Lipsey-2015-subset.rds")
+```
+
+The subset shipped with this course has already been filtered to exclude observations with missing covariates, matching the preparation in the original simulation code. Let us inspect its dimensions and structure:
+
+```{r}
+#| label: tsl15-dimensions
+dim(TSL15)
+```
+
+```{r}
+#| label: tsl15-names
+names(TSL15)
+```
+
+The dataset has `r nrow(TSL15)` rows (effect sizes) from `r length(unique(TSL15$studyid))` unique studies. Each row represents one effect size estimate with its sampling variance, covariate values, and identifiers. Here is a glimpse of the key columns:
+
+```{r}
+#| label: tsl15-head
+TSL15 |>
+  dplyr::select(studyid, esid, es, V, dv_cat, Ctype, postwks, percoll, permale, attrition_all) |>
+  head(8) |>
+  knitr::kable(digits = 3, caption = "First eight rows of the TSL15 dataset.")
+```
+
+
+## Dependent variable structure {#sec-dv-structure}
+
+The dependent variable category (`dv_cat`) classifies how each effect size measures alcohol consumption. There are six categories:
+
+```{r}
+#| label: dv-cat-freq
+dv_freq <- table(TSL15$dv_cat)
+dv_freq_df <- data.frame(
+  Category = names(dv_freq),
+  `Effect sizes` = as.integer(dv_freq),
+  check.names = FALSE
+)
+knitr::kable(dv_freq_df, caption = "Number of effect sizes by dependent variable category.")
+```
+
+Crucially, `dv_cat` varies *within* studies. Most studies report outcomes on multiple measures of alcohol consumption, which is precisely what makes it a useful focal predictor for testing within-study efficiency gains:
+
+```{r}
+#| label: dv-within-study
+dv_per_study <- TSL15 |>
+  dplyr::group_by(studyid) |>
+  dplyr::summarise(n_categories = dplyr::n_distinct(dv_cat), .groups = "drop")
+
+cat_counts <- table(`DV categories per study` = dv_per_study$n_categories)
+cat_counts_df <- data.frame(
+  `Number of DV categories` = as.integer(names(cat_counts)),
+  `Number of studies` = as.integer(cat_counts),
+  check.names = FALSE
+)
+knitr::kable(cat_counts_df, caption = "Distribution of DV category diversity across studies.")
+```
+
+Only `r sum(dv_per_study$n_categories == 1)` studies report effect sizes in a single DV category. The remaining `r sum(dv_per_study$n_categories > 1)` studies contribute effect sizes in two or more categories, producing within-study variation in `dv_cat`. This is the structural feature that allows the CMVE and SCE working models to potentially outperform the simpler CE model for `dv_cat` coefficients.
+
+::: {.callout-tip}
+## Why within-study variation matters
+When a predictor varies within studies, the CE working model --- which assumes a single study-level random effect --- cannot exploit the within-study covariate contrasts. The CMVE and SCE models, which allow category-specific random effects, can weight these contrasts more efficiently. The simulation in @pustejovsky2022 quantifies this efficiency gain.
+:::
+
+
+### Effect size distributions by DV category
+
+Beyond simple counts, it is useful to see how the effect sizes themselves are distributed within each DV category. The ridgeline plot below overlays smoothed density estimates for each category, making it easy to compare central tendency and spread:
+
+```{r}
+#| label: fig-ridgeline-dv
+#| fig-cap: "Distribution of effect sizes (Hedges' g) by dependent variable category. The dashed vertical line marks zero (no effect)."
+#| fig-width: 8
+#| fig-height: 6
+library(ggridges)
+
+TSL15 |>
+  ggplot(aes(x = es, y = dv_cat, fill = dv_cat)) +
+  geom_density_ridges(alpha = 0.7, scale = 1.2) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  labs(x = "Effect size (Hedges' g)", y = NULL,
+       title = "Distribution of effect sizes by dependent variable category") +
+  theme(legend.position = "none")
+```
+
+Most categories show distributions centered slightly above zero, consistent with small positive intervention effects. The spread varies noticeably across categories --- some (e.g., BAC) have tighter distributions while others (e.g., peak consumption) show heavier tails. This heterogeneity in both location and scale across DV categories is precisely the feature that the CMVE working model with heterogeneous compound-symmetric random effects is designed to capture.
+
+
+## Control group structure {#sec-ctype-structure}
+
+The control group type (`Ctype`) classifies the comparison condition used in each study:
+
+```{r}
+#| label: ctype-freq
+ct_freq <- table(TSL15$Ctype)
+ct_freq_df <- data.frame(
+  Category = names(ct_freq),
+  `Effect sizes` = as.integer(ct_freq),
+  check.names = FALSE
+)
+knitr::kable(ct_freq_df, caption = "Number of effect sizes by control group type.")
+```
+
+Unlike `dv_cat`, the control group type is almost entirely a *between-study* variable. Only a handful of studies use more than one type of control group:
+
+```{r}
+#| label: ctype-between-study
+ct_per_study <- TSL15 |>
+  dplyr::group_by(studyid) |>
+  dplyr::summarise(n_ctypes = dplyr::n_distinct(Ctype), .groups = "drop")
+
+table(`Ctype categories per study` = ct_per_study$n_ctypes)
+```
+
+`r sum(ct_per_study$n_ctypes == 1)` of `r nrow(ct_per_study)` studies use a single control group type. This between-study structure means that within-study working models (CMVE, SCE) cannot exploit within-study contrasts for `Ctype` --- we should expect smaller efficiency gains for `Ctype` coefficients than for `dv_cat` coefficients. The simulation confirms this expectation.
+
+::: {.callout-note}
+## Handling multi-control studies
+The `prepare-TSL15-data.R` script drops the "no treatment" condition from the three studies that use multiple control group types. This ensures `Ctype` is purely between-study in the analysis data, simplifying interpretation and making the SCE model identifiable with a diagonal random effects structure (`struct = "DIAG"`).
+:::
+
+
+## Covariates and centering {#sec-covariates}
+
+In addition to the categorical predictors, the model includes four continuous covariates:
+
+| Covariate | Variable | Description |
+|-----------|----------|-------------|
+| Follow-up time | `postwks` | Weeks between intervention and outcome measurement |
+| College proportion | `percoll` | Proportion of sample enrolled in college |
+| Proportion male | `permale` | Proportion of male participants |
+| Attrition | `attrition_all` | Overall attrition rate |
+
+: Continuous covariates in the TSL15 analysis. {#tbl-covariates}
+
+```{r}
+#| label: covariate-summary
+TSL15 |>
+  dplyr::summarise(
+    `postwks (median)` = median(postwks, na.rm = TRUE),
+    `percoll (mean)` = mean(percoll, na.rm = TRUE),
+    `permale (mean)` = mean(permale, na.rm = TRUE),
+    `attrition (median)` = median(attrition_all, na.rm = TRUE)
+  ) |>
+  knitr::kable(digits = 3, caption = "Summary statistics for continuous covariates.")
+```
+
+### The centering strategy
+
+@pustejovsky2022 center each covariate at a substantively meaningful reference value before fitting any models:
+
+| Variable | Centering | Code | Interpretation at zero |
+|----------|-----------|------|----------------------|
+| `postwks` | Cap at 26, subtract 12 | `pmin(postwks, 26) - 12` | 12-week follow-up |
+| `percoll` | Subtract 1 | `percoll - 1` | College-age sample |
+| `permale` | Subtract 0.5 | `permale - 0.5` | 50% male |
+| `attrition` | Subtract median | `attrition_all - 0.163` | ~16% attrition |
+
+: Centering strategy for continuous covariates. {#tbl-centering}
+
+Follow-up time receives special treatment: it is capped at 26 weeks and then a separate indicator (`postwks_long`) flags observations beyond 26 weeks. This allows a piecewise-linear relationship with a potential level shift for long follow-up periods.
+
+::: {.callout-important}
+## Why centering matters
+In a no-intercept model with categorical predictors (e.g., `es ~ 0 + dv_cat + postwks_c + ...`), the category coefficients represent the average effect size *at the reference values of all continuous covariates*. Without centering, these coefficients would represent the effect size when all continuous covariates equal zero --- a value that may be nonsensical (e.g., zero weeks of follow-up, zero percent male). Centering makes the focal coefficients directly interpretable and ensures the simulation's "true" $\boldsymbol{\beta}$ values correspond to meaningful quantities.
+:::
+
+
+### Covariate correlations
+
+Before using these covariates in a meta-regression, it is worth checking how strongly they are correlated with one another. Large pairwise correlations could affect coefficient stability and complicate interpretation:
+
+```{r}
+#| label: tbl-covariate-cors
+TSL15 |>
+  dplyr::select(postwks, percoll, permale, attrition_all) |>
+  cor(use = "pairwise.complete.obs") |>
+  round(2) |>
+  knitr::kable(caption = "Correlation matrix of continuous covariates.")
+```
+
+The pairwise correlations among the four continuous covariates are modest, with no pair exceeding a magnitude that would raise collinearity concerns. This supports including all four covariates simultaneously in the meta-regression model. The weak correlations also mean that centering each covariate independently (rather than jointly) is unlikely to distort the interpretation of the regression coefficients.
+
+
+## Study structure {#sec-study-structure}
+
+The number of effect sizes per study is highly variable, which is typical in meta-analyses with dependent effect sizes:
+
+```{r}
+#| label: fig-es-per-study
+#| fig-cap: "Distribution of effect sizes per study in the TSL15 dataset. The dashed vertical line marks the simulation cap of 12 effect sizes."
+#| fig-width: 7
+#| fig-height: 4
+es_per_study <- TSL15 |>
+  dplyr::count(studyid, name = "n_effects")
+
+ggplot(es_per_study, aes(x = n_effects)) +
+  geom_histogram(binwidth = 2, fill = "steelblue", color = "white", alpha = 0.8) +
+  geom_vline(xintercept = 12, linetype = "dashed", color = "firebrick", linewidth = 0.8) +
+  annotate("text", x = 14, y = Inf, label = "max_effects = 12",
+           hjust = 0, vjust = 1.5, color = "firebrick", size = 3.5) +
+  labs(x = "Number of effect sizes per study", y = "Number of studies") +
+  theme_minimal(base_size = 13)
+```
+
+```{r}
+#| label: es-per-study-summary
+summary(es_per_study$n_effects)
+```
+
+A few studies contribute an extremely large number of effect sizes (up to `r max(es_per_study$n_effects)`), which would dominate the simulated datasets. The simulation addresses this by capping each study at `max_effects = 12` effect sizes. When a study contributes more than 12, a random subset of 12 is drawn. This constraint keeps individual studies from having outsized influence while preserving the naturally skewed distribution.
+
+The primary study sample sizes (total across treatment and control groups) also vary substantially:
+
+```{r}
+#| label: sample-size-summary
+TSL15 |>
+  dplyr::mutate(n_obs = n_tx_ob + n_ct_ob) |>
+  dplyr::group_by(studyid) |>
+  dplyr::summarise(n_obs = mean(n_obs), .groups = "drop") |>
+  dplyr::pull(n_obs) |>
+  summary()
+```
+
+These real sample sizes --- rather than parametrically generated ones --- are used directly in the simulation, preserving the heterogeneity in study precision that characterizes the actual meta-analytic evidence base.
+
+### Sample size versus number of outcomes
+
+Do larger studies tend to report more effect sizes? The following scatter plot examines the relationship between total sample size (treatment plus control) and the number of effect sizes contributed by each study:
+
+```{r}
+#| label: fig-n-vs-effects
+#| fig-cap: "Relationship between total sample size and number of effect sizes per study. The dashed red line marks the simulation cap of 12 effect sizes. Sample sizes are shown on a log scale."
+#| fig-width: 7
+#| fig-height: 5
+study_summary <- TSL15 |>
+  dplyr::group_by(studyid) |>
+  dplyr::summarise(
+    n_effects = dplyr::n(),
+    N = first(n_tx_as) + first(n_ct_as),
+    .groups = "drop"
+  ) |>
+  dplyr::filter(!is.na(N))
+
+study_summary |>
+  ggplot(aes(x = N, y = n_effects)) +
+  geom_point(alpha = 0.6, color = "steelblue") +
+  geom_hline(yintercept = 12, linetype = "dashed", color = "firebrick") +
+  scale_x_log10() +
+  labs(x = "Total sample size (log scale)", y = "Number of effect sizes",
+       title = "Study size vs. number of outcomes") +
+  annotate("text", x = max(study_summary$N, na.rm = TRUE), y = 13,
+           label = "max_effects = 12", hjust = 1, color = "firebrick", size = 3)
+```
+
+There is no strong association between sample size and the number of outcomes a study reports. This suggests that the decision to measure multiple outcome types is driven more by study design choices than by resource availability. The simulation cap at 12 effect sizes trims the most prolific studies without systematically excluding large or small ones.
+
+
+## From real data to simulation parameters {#sec-real-to-sim}
+
+This is where the @tannersmiths2015 dataset stops being a descriptive exercise and becomes the engine of the simulation. The script `R/prepare-TSL15-data.R` fits multivariate meta-analytic models to the real data and extracts the fitted parameters to serve as "truth" in the simulation. Let us walk through this process step by step.
+
+### Step 1: Data preparation
+
+The script begins by loading the data, excluding observations with missing covariates, relabeling factor levels for cleaner code, centering covariates, and filtering multi-control studies:
+
+```{r}
+#| label: prepare-step1
+#| eval: false
+TSL15 <-
+  readRDS("data/Tanner-Smith-Lipsey-2015-subset.rds") |>
+  filter(!is.na(percoll), !is.na(attrition_all), !is.na(permale))
+
+levels(TSL15$dv_cat) <- c("freq","heavy","quantity","peak","BAC","combined")
+levels(TSL15$Ctype) <- c("Strawman","Attention","TAU","nontreatment")
+
+TSL15_cent <-
+  TSL15 |>
+  group_by(studyid) |>
+  mutate(
+    n_grps = length(unique(Ctype)),
+    n_obs = n_tx_ob + n_ct_ob,
+    postwks_c = pmin(postwks, 26) - 12,
+    postwks_long = as.numeric(postwks > 26),
+    percoll_c = percoll - 1,
+    permale_c = permale - 0.5,
+    attrition_c = attrition_all - median(attrition_all),
+    study_dv = paste(studyid, dv_cat, sep = "-"),
+    study_ctype = paste(studyid, Ctype, sep = "-")
+  ) |>
+  # Drop non-treatment from multi-control studies
+  filter(n_grps == 1 | Ctype != "nontreatment")
+```
+
+After this step, the data contain `r 117` studies and `r 1179` effect sizes --- a few rows fewer than the raw data because of the multi-control filtering.
+
+### Step 2: Fit the CMVE model for `dv_cat`
+
+The script constructs the design matrix and fits a multivariate meta-regression with category-specific, heterogeneous compound-symmetric (HCS) random effects:
+
+```{r}
+#| label: prepare-step2
+#| eval: false
+covariates <- model.matrix(
+  ~ 0 + dv_cat + postwks_c + postwks_long + percoll_c + permale_c + attrition_c,
+  data = TSL15_cent
+)
+
+V_mat <- impute_covariance_matrix(
+  TSL15_cent$V,
+  cluster = TSL15_cent$studyid,
+  r = 0.6,
+  smooth_vi = TRUE
+)
+
+dv_multivariate <- rma.mv(
+  es ~ 0 + dv_cat + postwks_c + postwks_long + percoll_c + permale_c + attrition_c,
+  V = V_mat,
+  random = ~ dv_cat | studyid, struct = "HCS",
+  data = TSL15_cent, sparse = TRUE
+)
+```
+
+The `struct = "HCS"` specification estimates category-specific between-study variances $\tau_c^2$ and a common correlation $\psi$ between categories. The `impute_covariance_matrix()` call constructs the block-diagonal sampling covariance matrix assuming a within-study correlation of 0.6.
+
+### Step 3: Extract parameters
+
+The fitted model yields the parameters that will drive the simulation:
+
+```{r}
+#| label: prepare-step3
+#| eval: false
+beta <- dv_multivariate$beta[,1]
+tau_covariate <- TSL15_cent$dv_cat
+tau_corr <- dv_multivariate$rho
+tau_scalar <- sqrt(dv_multivariate$tau2 / dv_multivariate$tau2[3])
+tau_scalar <- sqrt(seq(2.0, 0.5, length.out = length(tau_scalar)))
+```
+
+Note that `tau_scalar` is *not* taken directly from the model estimates. The fitted values are replaced by a smooth sequence from $\sqrt{2.0}$ down to $\sqrt{0.5}$, ensuring a clean spread of category-specific variance scaling factors. This is a deliberate design choice: the simulation uses the general *pattern* of heterogeneous variances from the real data while smoothing out estimation noise.
+
+### Step 4: Fit the SCE model for `Ctype`
+
+A parallel process fits a diagonal (SCE) model for the control group type predictor:
+
+```{r}
+#| label: prepare-step4
+#| eval: false
+dv_Ctype <- rma.mv(
+  es ~ 0 + Ctype + postwks_c + postwks_long + percoll_c + permale_c + attrition_c,
+  V = V_mat,
+  random = ~ Ctype | studyid, struct = "DIAG",
+  data = TSL15_cent, sparse = TRUE
+)
+```
+
+Here `struct = "DIAG"` estimates category-specific variances but sets the between-category correlation to zero --- appropriate because `Ctype` is a between-study variable, making the cross-category correlation unidentifiable.
+
+### The extracted parameter values
+
+We can load the saved model data to inspect the actual values:
+
+```{r}
+#| label: dv-model-params
+load("data/dv-model-data.Rdata")
+
+beta_df <- data.frame(
+  Coefficient = names(beta),
+  Value = round(beta, 4)
+)
+knitr::kable(beta_df, caption = "Regression coefficients (beta) from the CMVE model fitted to TSL15.",
+             row.names = FALSE)
+```
+
+```{r}
+#| label: dv-tau-params
+cat("Between-category correlation (tau_corr):", round(tau_corr, 4), "\n")
+cat("Variance scaling factors (tau_scalar):", round(tau_scalar, 4), "\n")
+```
+
+The category coefficients $\beta_1, \ldots, \beta_6$ represent average effect sizes for each DV category at the reference covariate values (12 weeks, college sample, 50% male, 16% attrition). They are all small and positive, ranging from about 0.09 (frequency of use) to 0.18 (combined measures). The correlation $\psi \approx 0.69$ indicates substantial positive dependence between category-specific random effects, and the scaling factors $\xi_c$ range from 1.41 down to 0.71, producing category-specific variances from $2.0\tau^2$ down to $0.5\tau^2$.
+
+```{r}
+#| label: ctype-model-params
+load("data/Ctype-model-data.Rdata")
+
+beta_ct_df <- data.frame(
+  Coefficient = names(beta),
+  Value = round(beta, 4)
+)
+knitr::kable(beta_ct_df, caption = "Regression coefficients (beta) from the SCE model fitted to TSL15 (Ctype specification).",
+             row.names = FALSE)
+```
+
+```{r}
+#| label: ctype-tau-params
+cat("Between-category correlation (tau_corr):", tau_corr, "\n")
+cat("Variance scaling factors (tau_scalar):", round(tau_scalar, 4), "\n")
+```
+
+For the `Ctype` specification, the correlation is fixed at zero (unidentifiable for a between-study predictor), and the scaling factors follow a smooth sequence from $\sqrt{0.5} \approx 0.71$ up to $\sqrt{2.0} \approx 1.41$.
+
+::: {.callout-note}
+## What gets saved?
+Each `.Rdata` file stores seven objects: `covariates` (the full design matrix), `studyID` (study identifiers), `subgroup` (the focal categorical variable), `sample_sizes` (mean observed sample size per study), `beta` (regression coefficients), `tau_covariate` (which variable indexes the random effects), `tau_corr` (between-category correlation), and `tau_scalar` (variance scaling factors). Together, these fully specify the data-generating process for the simulation.
+:::
+
+
+## Why real-data calibration? {#sec-why-calibration}
+
+Why go through the trouble of fitting models to real data when you could simply choose "reasonable" parameter values? @pustejovsky2022 follow a principle that @miratrixpustejovsky2024 articulate clearly: simulation studies serve as *evidence*, and their evidential value depends on how well the simulated conditions correspond to the applied settings where the methods will be used.
+
+Real-data calibration provides several concrete advantages:
+
+1. **Realistic covariate structure.** The design matrices in the simulation are not abstract --- they are actual rows from the TSL15 data. The correlation structure among covariates, the distribution of effect sizes per study, and the balance (or imbalance) across categories all reflect a genuine meta-analysis.
+
+2. **Defensible parameter values.** The regression coefficients, variance components, and sample sizes are fitted to real data rather than chosen ad hoc. This makes the simulation harder to dismiss as a straw-man exercise.
+
+3. **Proper scaling.** The ratio of between-study to within-study variance, the magnitude of covariate effects, and the degree of effect size dependence are all calibrated to observed values. A simulation with $\tau^2 = 1.0$ and $\beta = 5.0$ would tell us little about settings where effect sizes are typically small.
+
+4. **External validity.** By anchoring to a specific applied context, the results speak directly to practitioners who work with similar meta-analytic datasets. The conditions are not "arbitrary point A vs. arbitrary point B" --- they are "what happens in a dataset like TSL15?"
+
+Of course, real-data calibration does not guarantee that results generalize beyond the specific dataset used for calibration. The @pustejovsky2022 simulation varies design factors (number of studies, $\tau$, $\omega$, $\rho$) around the TSL15 baseline, creating a grid of conditions that spans a broader region while remaining anchored to an empirically grounded center.
+
+::: {.callout-tip}
+## A general principle
+When designing your own simulation studies, consider whether a real dataset can serve as the empirical foundation. Even partial calibration --- using real sample sizes, or setting one parameter to its estimated value while varying others --- strengthens the evidential basis of the simulation. Chapter 9 of @miratrixpustejovsky2024 discusses this design strategy in depth.
+:::
+
+
+## Exercises {.unnumbered}
+
+::: {.callout-caution title="Exercise 3.1: Exploring another moderator"}
+Choose a different categorical variable from the TSL15 data (e.g., `Txtype`, the type of treatment intervention). Construct a frequency table and a cross-tabulation showing how many studies span multiple categories. Does this variable vary primarily within or between studies? What implications would this have for the choice of working model?
+
+::: {.callout-tip title="Hint" collapse="true"}
+Use `group_by(studyid) |> summarise(n_distinct(...))` to count categories per study. A strong answer would include a frequency table, a count of how many studies span multiple categories, and a one-sentence statement about whether the variable varies primarily within or between studies.
+:::
+:::
+
+::: {.callout-caution title="Exercise 3.2: MCSE planning"}
+Using the MCSE formulas from Mini Course 1, calculate how many replications would be needed to achieve an MCSE for coverage of less than 0.005 (i.e., half a percentage point). How does this compare to the $R = 4{,}012$ replications used by P&T?
+
+::: {.callout-tip title="Hint" collapse="true"}
+MCSE(coverage) $= \sqrt{p(1-p)/R}$. Set $p = 0.95$ and solve for $R$.
+:::
+:::

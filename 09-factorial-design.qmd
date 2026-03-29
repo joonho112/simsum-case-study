@@ -1,0 +1,253 @@
+# The Factorial Design {#sec-design}
+
+```{r}
+#| label: setup-design
+#| include: false
+source("_common.R")
+```
+
+The previous chapters built the machinery for a single simulation iteration: generate a synthetic meta-analytic dataset (`generate_meta()`), fit the three working models (`estimate_models()`), and wrap both steps into a repeatable pipeline (`simulate_meta()`). But a Monte Carlo study is only as informative as the range of conditions it explores. This chapter covers the **experimental design** of the simulation --- the systematic variation of data-generating parameters that lets us understand when and why different working models gain or lose efficiency.
+
+In the ADEMP framework, we are now defining the **D** (data-generating mechanisms) component in full. In the DSR workflow of @miratrixpustejovsky2024, this corresponds to Step 1: *Plan the experiment*. Designing a simulation study requires the same care as designing a laboratory experiment --- choosing factors and levels, considering interactions, and managing the total number of conditions to keep computation feasible.
+
+
+## Two model specifications {#sec-two-specs}
+
+@pustejovsky2022 run the simulation twice, once for each empirical analysis in the paper:
+
+1. **dvcat** (type of dependent variable): The focal predictor varies *within* studies and has $C = 6$ categories (frequency of use, frequency of heavy use, quantity of use, peak consumption, blood alcohol concentration, combined measures).
+
+2. **Ctype** (type of control group): The focal predictor varies *at the study level* and has $C = 4$ categories (straw man, attention/sham, treatment as usual, no treatment).
+
+Why two separate simulations rather than one combined design? The answer lies in *efficiency*. The working models differ most sharply in how they handle within-study versus between-study predictors. A within-study predictor like `dvcat` creates multiple effect sizes per study that belong to different categories, giving the CHE and SCE models leverage to improve precision through their richer variance structures. A between-study predictor like `Ctype` assigns each study to a single category, so the efficiency gains from modeling within-study dependence are expected to be smaller. Running both specifications lets the simulation quantify this contrast directly.
+
+The two driver scripts --- `RVE-simulation-dvcat.R` and `RVE-simulation-Ctype.R` --- are nearly identical in structure. They share the same design factors, the same filtering logic, and the same pipeline functions. The only differences are the empirical data objects loaded at the top (covariates, study IDs, subgroup indicators, sample sizes, and calibrated parameter values).
+
+
+## Design factors and levels {#sec-factors}
+
+The simulation varies six factors. Five are crossed; one is held fixed:
+
+| Factor | Code name | Levels | Rationale |
+|--------|-----------|--------|-----------|
+| Number of studies | `n_studies` | 30, 60 | Small vs. moderate meta-analysis size |
+| Variance structure | `struct` | `"CS"`, `"HCS"` | Compound-symmetric (CE/CHE) vs. heterogeneous (CMVE) DGP |
+| Between-study SD | `tau` | 0.05, 0.10, 0.20 | Small to large heterogeneity |
+| Within-study SD | `omega` | 0.00, 0.10 | No vs. moderate within-study heterogeneity |
+| Mean within-study correlation | `rho` | 0.2, 0.4, 0.6, 0.8 | Low to high outcome correlation |
+| Concentration parameter | `nu` | 9 | Fixed; controls spread of study-level $\rho_j$ |
+
+: Design factors for the @pustejovsky2022 simulation. {#tbl-factors}
+
+A few notes on why these particular levels were chosen:
+
+- **`n_studies`**: Meta-analyses with dependent effect sizes typically involve 20--100 studies. The values 30 and 60 span the range from modestly sized to comfortably powered.
+
+- **`tau`**: On the scale of Hedges' $g$, $\tau = 0.05$ represents near-homogeneity, $\tau = 0.10$ is moderate, and $\tau = 0.20$ is substantial. These values were calibrated against the empirical estimates from the Tanner-Smith and Lipsey (2015) dataset.
+
+- **`rho`**: The assumed working correlation is fixed at 0.6 across all estimation methods. By varying the true mean correlation from 0.2 to 0.8, the simulation tests robustness to mis-specification of this assumption. The value 0.6 matches the commonly used default in practice.
+
+- **`nu = 9`**: This concentration parameter for the Beta distribution of study-level correlations yields a standard deviation of roughly 0.13--0.15, providing realistic heterogeneity in $\rho_j$ across studies without producing extreme values near 0 or 1.
+
+
+## Filtering redundant conditions {#sec-filtering}
+
+The full factorial crossing of the five varying factors would yield $2 \times 2 \times 3 \times 2 \times 4 = 96$ conditions. But not all combinations are meaningful.
+
+The key constraint is:
+
+```r
+struct == "CS" | omega == 0.00
+```
+
+The logic: when `struct = "HCS"` (the CMVE data-generating process), within-study heterogeneity is already built into the model through the category-specific variance scalars $\xi_c$. The CMVE DGP generates random effects $(u_{1j}, \ldots, u_{Cj})$ with $\text{Var}(u_{cj}) = \xi_c^2 \tau^2$, producing variances that range from $0.5\tau^2$ to $2.0\tau^2$ across categories. In this structure, `omega` has no role --- there is no separate additive within-study variance component. Setting `omega = 0.10` under `struct = "HCS"` would create a condition with no clear interpretation, so these cells are excluded.
+
+The filtering removes the `struct = "HCS"` with `omega = 0.10` cells: $1 \times 2 \times 3 \times 1 \times 4 = 24$ conditions. This leaves:
+
+$$96 - 24 = 72 \text{ unique conditions}$$
+
+Here is the code to construct and filter the design grid:
+
+```{r}
+#| label: design-grid
+design <- expand.grid(
+  n_studies = c(30, 60),
+  struct = c("CS", "HCS"),
+  tau = c(0.05, 0.10, 0.20),
+  omega = c(0.00, 0.10),
+  rho = c(0.2, 0.4, 0.6, 0.8),
+  nu = 9
+)
+
+nrow(design)
+
+design <- subset(design, struct == "CS" | omega == 0.00)
+
+nrow(design)
+```
+
+The 72 conditions represent the complete experimental space for each model specification.
+
+
+## The three DGPs as design conditions {#sec-three-dgps}
+
+The `struct` and `omega` factors jointly determine which of the three data-generating processes operates in each condition. This mapping is central to interpreting the results:
+
+| `struct` | `omega` | DGP | Description |
+|----------|---------|-----|-------------|
+| `"CS"` | 0.00 | CE (Correlated Effects) | Common study-level random effect only |
+| `"CS"` | 0.10 | CHE (Correlated-and-Hierarchical Effects) | Study-level + effect-level random effects |
+| `"HCS"` | 0.00 | CMVE (Correlated Multivariate Effects) | Category-specific random effects with correlation |
+
+: Mapping from design factors to data-generating processes. {#tbl-dgp-map}
+
+Under the CE DGP, all effect sizes within a study share the same true deviation from the regression surface: $\delta_{ij} = \mathbf{x}_{ij}\boldsymbol{\beta} + u_j$. Under the CHE DGP, each effect size also gets its own deviation: $\delta_{ij} = \mathbf{x}_{ij}\boldsymbol{\beta} + u_j + v_{ij}$. Under the CMVE DGP, the random effects are category-specific: $\delta_{ij} = \mathbf{x}_{ij}\boldsymbol{\beta} + \sum_c d_{ij}^c u_{cj}$.
+
+Each DGP can be "correct" for one of the three working models (CE, CHE, or SCE) and "wrong" for the others. This crossed structure --- three DGPs times three estimation methods --- is what allows the simulation to assess both efficiency (when the model is correct) and robustness (when it is mis-specified). Note that CMVE appears only as a data-generating process, not as an estimated working model in the simulation. P&T estimate CE, CHE, and SCE on data generated under all three DGPs, but they do not fit the CMVE model itself --- its many parameters would make estimation unreliable with the sample sizes studied.
+
+We can verify the DGP counts within our design grid:
+
+```{r}
+#| label: dgp-counts
+design |>
+  dplyr::mutate(
+    dgp = dplyr::case_when(
+      struct == "CS" & omega == 0.00 ~ "CE",
+      struct == "CS" & omega == 0.10 ~ "CHE",
+      struct == "HCS" & omega == 0.00 ~ "CMVE"
+    )
+  ) |>
+  dplyr::count(dgp)
+```
+
+Each DGP contributes 24 conditions ($2 \times 3 \times 4 = 24$ from the remaining factors `n_studies`, `tau`, and `rho`), and $24 \times 3 = 72$ total.
+
+
+## Total scenario count {#sec-total-count}
+
+A common source of confusion is double-counting. Since `n_studies` is already one of the six design factors included in the 72-condition grid, it does not multiply the count further. The 72 conditions already include both the $J = 30$ and $J = 60$ rows.
+
+To summarize:
+
+- **Per model specification**: 72 unique parameter combinations
+- **Model specifications**: 2 (dvcat and Ctype)
+- **Grand total**: $72 \times 2 = 144$ unique conditions across the full simulation
+
+Each of the 72 conditions is run with 4,012 replications, yielding $72 \times 4{,}012 = 288{,}864$ simulation iterations per specification, and $288{,}864 \times 2 = 577{,}728$ iterations in total.
+
+
+## Number of replications {#sec-replications}
+
+Each condition is replicated $R = 4{,}012$ times. Why this specific number? The iterations are distributed across 34 batches for parallel execution, and $4{,}012 / 34 = 118$ iterations per batch. The total was chosen to achieve adequate Monte Carlo precision for the primary performance measures.
+
+### MCSE precision
+
+Following the framework in @morris2019, we can quantify the Monte Carlo standard error (MCSE) for the key performance measures:
+
+**Bias.** If the true standard deviation of an estimator is approximately 0.05 (a reasonable value for meta-regression coefficients on the Hedges' $g$ scale), then:
+
+$$\text{MCSE}_{\text{bias}} = \frac{\text{SD}}{\sqrt{R}} \approx \frac{0.05}{\sqrt{4012}} \approx 0.0008$$
+
+This means bias estimates are precise to roughly three decimal places.
+
+**Coverage.** If the true coverage probability is 0.95, then:
+
+$$\text{MCSE}_{\text{coverage}} = \sqrt{\frac{0.95 \times 0.05}{R}} \approx \sqrt{\frac{0.0475}{4012}} \approx 0.0034$$
+
+A 95% confidence interval for the true coverage rate is approximately $0.95 \pm 2 \times 0.0034 = [0.943, 0.957]$. Coverage values outside this range provide strong evidence of miscalibration.
+
+These precision levels are consistent with the guidelines discussed in @miratrixpustejovsky2024 for choosing the number of replications in a simulation study.
+
+
+## Design matrix as a data frame {#sec-design-df}
+
+The design grid is constructed as a data frame, which can then be iterated over to run the simulation. The original code and a `tidyr`-based equivalent produce identical results:
+
+::: {.panel-tabset}
+#### simhelpers
+```{r}
+#| label: design-simhelpers
+library(tidyr)
+
+design_tidy <- expand_grid(
+  n_studies = c(30, 60),
+  struct = c("CS", "HCS"),
+  tau = c(0.05, 0.10, 0.20),
+  omega = c(0.00, 0.10),
+  rho = c(0.2, 0.4, 0.6, 0.8)
+) |>
+  dplyr::filter(struct == "CS" | omega == 0.00)
+
+nrow(design_tidy)
+```
+
+The `expand_grid()` function from `tidyr` produces a tibble with factors ordered by the first-listed variable varying slowest (the opposite of `expand.grid()`). The filtering step is the same.
+
+#### Original P&T
+```{r}
+#| label: design-original
+#| eval: false
+
+design_factors <- list(
+  n_studies = c(30, 60),
+  struct = c("CS", "HCS"),
+  tau = c(0.05, 0.10, 0.20),
+  omega = c(0.00, 0.10),
+  rho = c(0.2, 0.4, 0.6, 0.8),
+  nu = 9
+)
+
+params <- expand.grid(design_factors)
+params <- subset(params, struct == "CS" | omega == 0.00)
+
+nrow(params)
+```
+
+The original code uses `expand.grid()` from base R and includes `nu = 9` in the factor list. Since `nu` has a single level, it adds a column but does not change the number of rows. The `subset()` call applies the same constraint.
+:::
+
+
+## Batch structure for parallel execution {#sec-batches}
+
+@pustejovsky2022 distribute the computation across 34 batches. Each batch runs 118 iterations per condition ($118 \times 34 = 4{,}012$). The batching is achieved by adding a `batch` factor to the grid before filtering:
+
+```{r}
+#| label: batch-structure
+#| eval: false
+
+batches <- 34
+total_reps <- 4012
+
+params <- expand.grid(c(design_factors, list(batch = 1:batches)))
+params <- subset(params, struct == "CS" | omega == 0.00)
+
+nrow(params)                           # 72 conditions x 34 batches = 2,448 rows
+params$iterations <- total_reps / batches  # 118 iterations per row
+```
+
+Each row of the `params` data frame represents a single job: one parameter combination and one batch. The `batch` column is removed after seed assignment (it served only to create per-batch seeds), and the `iterations` column tells `simulate_meta()` how many repetitions to run for that job.
+
+The per-job seed assignment ensures reproducibility even under parallel execution:
+
+```{r}
+#| label: seed-assignment
+#| eval: false
+
+set.seed(20210128)
+params$seed <- round(runif(1) * 2^30) + 1:nrow(params)
+```
+
+This generates a unique seed for each of the 2,448 jobs by adding the row index to a single random offset. The `simulate_meta()` function calls `set.seed(seed)` at the start of each job, so results are fully reproducible regardless of the order in which jobs are dispatched to parallel workers.
+
+
+## Connection to experimental design principles {#sec-design-principles}
+
+The factorial structure of this simulation reflects several deliberate design choices discussed in @morris2019:
+
+**Full factorial with principled restrictions.** Rather than exploring a Latin hypercube or other space-filling design, the simulation uses a (nearly) full factorial. This is appropriate when the number of factors is small and interactions are scientifically meaningful. The only restriction --- removing `omega = 0.10` under `struct = "HCS"` --- arises from a structural redundancy, not from computational constraints.
+
+**Choosing levels to span the relevant range.** Each factor has levels chosen to represent the range of values encountered in practice, calibrated against the empirical TSL15 dataset. The levels of `tau` span the range from minimal to substantial heterogeneity. The levels of `rho` cover a wide range but are centered on the assumed working value of 0.6, which is critical for assessing robustness to mis-specification.
+
+**Breaking symmetries with the DGP.** The three DGPs are not merely different parameter settings --- they represent qualitatively different random-effects structures. By crossing three DGPs with three estimation methods, the simulation can separately quantify the *efficiency gain from a correctly specified model* and the *robustness cost of a mis-specified one*. This is the design principle of varying "what you assume" independently from "what is true," which @morris2019 emphasize as essential for evaluating statistical methods.
+
+**Connection to the broader DSR framework.** @miratrixpustejovsky2024 discuss simulation design as a special case of experimental design. The 72-condition grid is the simulation's "treatment structure," each replication is a "subject," and the performance metrics (bias, coverage, RMSE) are the "outcomes." Viewing the simulation through this lens helps ensure that the design supports the comparisons we care about --- in this case, the relative performance of CE, CHE, and SCE working models across a range of realistic scenarios.

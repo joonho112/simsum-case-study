@@ -1,0 +1,445 @@
+# Meta-Analytic Models and Working Models {#sec-models}
+
+```{r}
+#| label: setup-models
+#| include: false
+source("_common.R")
+```
+
+This chapter lays out the theoretical backbone of the @pustejovsky2022 simulation study: the *working models* that govern how effect sizes are weighted in meta-regression with robust variance estimation (RVE). We begin with the general meta-regression framework, then develop each working model in turn --- hierarchical effects (HE), correlated effects (CE), and correlated-and-hierarchical effects (CHE) --- showing their variance-covariance structures, weight matrices, and the intuition behind each. The later sections extend the framework to the sub-group correlated effects (SCE) and correlated multivariate effects (CMVE) models, and provide guidance on choosing among them.
+
+
+## The general meta-regression model {#sec-general-model}
+
+Consider a collection of $J$ studies, where study $j$ contributes $n_j$ effect size estimates. Let $T_{ij}$ denote effect size estimate $i$ from study $j$, with corresponding standard error $s_{ij}$, for $i = 1, \ldots, n_j$ and $j = 1, \ldots, J$. The general meta-regression model relates effect sizes to a set of predictors:
+
+$$
+T_{ij} = \mathbf{x}_{ij}\boldsymbol{\beta} + u_{ij} + e_{ij}
+$$ {#eq-general}
+
+where $\mathbf{x}_{ij}$ is a $1 \times p$ row vector of covariates (including an intercept), $\boldsymbol{\beta}$ is a $p \times 1$ vector of regression coefficients, $u_{ij}$ captures variation in true effect sizes beyond what the covariates explain, and $e_{ij} = T_{ij} - \theta_{ij}$ is sampling error.
+
+This model rests on four assumptions:
+
+1. **Unbiased estimation.** Each $T_{ij}$ is an unbiased estimate of a true effect size $\theta_{ij}$, so $\text{E}(e_{ij}) = 0$.
+2. **Known sampling variances.** The sampling variances $s_{ij}^2 = \text{Var}(e_{ij})$ are treated as fixed and known.
+3. **Between-study independence.** Effect sizes from *different* studies are uncorrelated: $\text{Cor}(e_{hj}, e_{ik}) = 0$ when $j \neq k$.
+4. **Within-study dependence.** Effect sizes from the *same* study may be correlated, but the exact structure of this dependence is typically unknown.
+
+The fourth assumption is the crux of the problem. Different working models propose different structures for this within-study dependence, and these structures determine the weight matrices used in estimation.
+
+@tbl-notation summarizes the notation used throughout this chapter.
+
+| Symbol | Description |
+|:-------|:------------|
+| $J$ | Number of studies |
+| $n_j$ | Number of effect sizes in study $j$ |
+| $T_{ij}$ | Effect size estimate $i$ from study $j$ |
+| $s_{ij}^2$ | Sampling variance of $T_{ij}$ (known) |
+| $\bar{s}_j^2$ | Average sampling variance in study $j$: $\frac{1}{n_j}\sum_{i=1}^{n_j} s_{ij}^2$ |
+| $\mathbf{x}_{ij}$ | $1 \times p$ row vector of covariates |
+| $\boldsymbol{\beta}$ | $p \times 1$ vector of regression coefficients |
+| $\tau^2$ | Between-study variance in true effect sizes |
+| $\omega^2$ | Within-study variance in true effect sizes |
+| $\rho$ | Assumed constant sampling correlation |
+| $\boldsymbol{\Phi}_j$ | $n_j \times n_j$ true variance-covariance matrix for study $j$ |
+| $\mathbf{W}_j$ | $n_j \times n_j$ weight matrix for study $j$ |
+| $\mathbf{I}_j$ | $n_j \times n_j$ identity matrix |
+| $\mathbf{J}_j$ | $n_j \times n_j$ matrix of ones |
+
+: Notation used in this chapter. {#tbl-notation}
+
+Throughout this chapter, $\bar{s}_j^2 = \frac{1}{n_j}\sum_{i=1}^{n_j} s_{ij}^2$ denotes the average sampling variance in study $j$. This corresponds to the supplement's convention of averaging individual sampling variances before constructing the off-diagonal elements of the covariance matrix (the `smooth_vi = TRUE` option in `clubSandwich::impute_covariance_matrix()`).
+
+
+## Robust variance estimation {#sec-rve}
+
+### Weighted least squares with general weights
+
+In matrix notation, the meta-regression for study $j$ is $\mathbf{T}_j = \mathbf{X}_j\boldsymbol{\beta} + \mathbf{u}_j + \mathbf{e}_j$, where $\mathbf{T}_j$ is the $n_j \times 1$ vector of effect sizes, $\mathbf{X}_j$ is the $n_j \times p$ design matrix, $\mathbf{u}_j$ is the vector of random effects, and $\mathbf{e}_j$ is the vector of sampling errors. Given weight matrices $\mathbf{W}_1, \ldots, \mathbf{W}_J$, the weighted least squares (WLS) estimator is:
+
+$$
+\hat{\boldsymbol{\beta}} = \mathbf{M}\left(\sum_{j=1}^{J} \mathbf{X}_j'\mathbf{W}_j\mathbf{T}_j\right), \quad \text{where} \quad \mathbf{M} = \left(\sum_{j=1}^{J} \mathbf{X}_j'\mathbf{W}_j\mathbf{X}_j\right)^{-1}
+$$ {#eq-wls}
+
+The true sampling variance of $\hat{\boldsymbol{\beta}}$ is:
+
+$$
+\text{Var}(\hat{\boldsymbol{\beta}}) = \mathbf{M}\left(\sum_{j=1}^{J} \mathbf{X}_j'\mathbf{W}_j\boldsymbol{\Phi}_j\mathbf{W}_j\mathbf{X}_j\right)\mathbf{M}
+$$ {#eq-true-var}
+
+where $\boldsymbol{\Phi}_j = \text{Var}(\mathbf{u}_j + \mathbf{e}_j)$ is the true variance-covariance matrix for study $j$. If we knew $\boldsymbol{\Phi}_j$ exactly, we could set $\mathbf{W}_j = \boldsymbol{\Phi}_j^{-1}$ and obtain the fully efficient estimator, with $\text{Var}(\hat{\boldsymbol{\beta}}) = \mathbf{M}$.
+
+### The key insight: separating weights from standard errors
+
+The RVE framework separates the choice of weight matrices from the estimation of standard errors. Rather than relying on the model-based variance in @eq-true-var (which requires knowing $\boldsymbol{\Phi}_j$), RVE estimates standard errors empirically using residual cross-products. Letting $\hat{\mathbf{e}}_j = \mathbf{T}_j - \mathbf{X}_j\hat{\boldsymbol{\beta}}$ denote the residual vector for study $j$, the robust variance estimator is:
+
+$$
+\widehat{\text{Var}}(\hat{\boldsymbol{\beta}}) = \mathbf{M}\left(\sum_{j=1}^{J} \mathbf{X}_j'\mathbf{W}_j\mathbf{A}_j\hat{\mathbf{e}}_j\hat{\mathbf{e}}_j'\mathbf{A}_j\mathbf{W}_j\mathbf{X}_j\right)\mathbf{M}
+$$ {#eq-rve}
+
+where $\mathbf{A}_j$ are adjustment matrices that correct for small-sample bias [@tipton2015; @tiptonpustejovsky2015]. Each individual product $\hat{\mathbf{e}}_j\hat{\mathbf{e}}_j'$ is a crude estimate of $\boldsymbol{\Phi}_j$, but the *average* across a sufficient number of studies is accurate enough to produce valid standard errors, hypothesis tests, and confidence intervals.
+
+### Why misspecification is tolerable
+
+This separation of concerns has a powerful consequence: even when the weight matrices are based on a misspecified working model, the RVE standard errors remain approximately unbiased. The estimator $\hat{\boldsymbol{\beta}}$ is unbiased under *any* set of weights, and the robust variance estimator in @eq-rve does not require the weights to match $\boldsymbol{\Phi}_j^{-1}$. What *does* depend on the weights is the *efficiency* of $\hat{\boldsymbol{\beta}}$ --- how precise the estimates are. Better weights yield more precise estimates, but even poor weights produce valid inference.
+
+### The role of working models
+
+A working model is a "good guess" at the true variance-covariance structure $\boldsymbol{\Phi}_j$. It serves two purposes:
+
+1. **Defining weights.** Substituting estimates of the working model's parameters into $\boldsymbol{\Phi}_j$ yields weight matrices that are approximately inverse-variance.
+2. **Improving efficiency.** The closer the working model is to the truth, the more precise $\hat{\boldsymbol{\beta}}$ will be --- without affecting the validity of inference.
+
+The original @hedges2010 working models use *approximately efficient* weights: diagonal matrices that approximate the inverse-variance weights but avoid inverting full $n_j \times n_j$ matrices. @pustejovsky2022 propose an alternative strategy of using *fully inverse-variance* weights (i.e., $\mathbf{W}_j = \hat{\boldsymbol{\Phi}}_j^{-1}$), which can yield non-trivial efficiency gains, particularly when within-study dependence is strong.
+
+
+::: {.callout-important}
+## Working models are not data-generating models
+The variance-covariance matrices $\boldsymbol{\Phi}_j$ described in this chapter are **working models** --- approximations used to construct the weight matrices $\mathbf{W}_j$ for WLS estimation. They are NOT the true data-generating covariance structures. Even when a working model is misspecified (i.e., $\boldsymbol{\Phi}_j$ does not match the true covariance), the RVE standard errors remain valid. The simulation in @pustejovsky2022 systematically evaluates what happens when the working model matches or diverges from the true DGP.
+:::
+
+
+## Model 1: Hierarchical effects (HE) {#sec-he}
+
+The hierarchical effects model is the first of the two original working models proposed by @hedges2010. It assumes that dependence between effect sizes within a study arises solely through shared study-level random effects:
+
+$$
+T_{ij} = \mathbf{x}_{ij}\boldsymbol{\beta} + u_j + v_{ij} + e_{ij}
+$$ {#eq-he}
+
+where:
+
+- $u_j$ is a study-level random effect with $\text{Var}(u_j) = \tau^2$ (between-study heterogeneity),
+- $v_{ij}$ is an effect-level random effect with $\text{Var}(v_{ij}) = \omega^2$ (within-study heterogeneity),
+- $e_{ij}$ is sampling error with $\text{Var}(e_{ij}) = s_{ij}^2$, and
+- $\text{Cov}(e_{hj}, e_{ij}) = 0$ for $h \neq i$ (sampling errors are independent within study).
+
+### Variance-covariance structure
+
+The marginal variance-covariance matrix under the HE model is:
+
+$$
+\boldsymbol{\Phi}_j^{HE} = \tau^2\mathbf{J}_j + \tilde{\mathbf{S}}_j
+$$ {#eq-phi-he}
+
+where $\tilde{\mathbf{S}}_j$ is a diagonal matrix with $i$th entry $\omega^2 + s_{ij}^2$. Written element-wise:
+
+$$
+\phi_{hij}^{HE} = \begin{cases} \tau^2 + \omega^2 + s_{ij}^2 & \text{if } h = i \\ \tau^2 & \text{if } h \neq i \end{cases}
+$$
+
+The inverse has a closed-form expression:
+
+$$
+\left(\boldsymbol{\Phi}_j^{HE}\right)^{-1} = \tilde{\mathbf{S}}_j^{-1} - x_j\,\tilde{\mathbf{S}}_j^{-1}\mathbf{J}_j\tilde{\mathbf{S}}_j^{-1}
+$$ {#eq-phi-he-inv}
+
+where $x_j = \left(\tau^{-2} + \sum_{i=1}^{n_j}(\omega^2 + s_{ij}^2)^{-1}\right)^{-1}$.
+
+### Approximately efficient weights
+
+Rather than using the full inverse in @eq-phi-he-inv, the original HE model uses diagonal "approximately efficient" weights:
+
+$$
+\mathbf{W}_j^{HE} = \text{diag}\left(\frac{1}{\hat{\tau}^2 + \hat{\omega}^2 + s_{1j}^2},\; \frac{1}{\hat{\tau}^2 + \hat{\omega}^2 + s_{2j}^2},\; \ldots,\; \frac{1}{\hat{\tau}^2 + \hat{\omega}^2 + s_{n_jj}^2}\right)
+$$ {#eq-w-he}
+
+where $\hat{\tau}^2$ and $\hat{\omega}^2$ are method-of-moments estimators. These weights ignore the off-diagonal structure entirely --- each effect size is weighted by the inverse of its marginal variance, as if the effects were independent.
+
+::: {.callout-note}
+## Intuition: dependence only through study-level random effects
+
+The HE model says: "Effect sizes within a study are correlated because they share a common study-level shift $u_j$, but their *estimation errors* are independent." This is appropriate when each effect size is measured on a separate sample within the study --- for example, when a multi-site trial reports one effect per site, or when different outcomes are measured on non-overlapping subgroups.
+:::
+
+
+## Model 2: Correlated effects (CE) {#sec-ce}
+
+The correlated effects model, the second original working model from @hedges2010, takes a different view of within-study dependence:
+
+$$
+T_{ij} = \mathbf{x}_{ij}\boldsymbol{\beta} + u_j + e_{ij}
+$$ {#eq-ce}
+
+where $\text{Var}(u_j) = \tau^2$, $\text{Var}(e_{ij}) = \bar{s}_j^2$, and $\text{Cov}(e_{hj}, e_{ij}) = \rho \bar{s}_j^2$ for $h \neq i$. Here $\bar{s}_j^2 = \frac{1}{n_j}\sum_{i=1}^{n_j} s_{ij}^2$ is the average sampling variance in study $j$, and $\rho$ is a constant assumed sampling correlation.
+
+The CE model imposes three simplifications relative to the HE model:
+
+1. **No within-study heterogeneity.** There is no $v_{ij}$ term --- all true effect sizes within a study are identical (conditional on covariates).
+2. **Approximately equal sampling variances.** Individual $s_{ij}^2$ values are replaced by the study-level average $\bar{s}_j^2$.
+3. **Constant sampling correlation.** The correlation $\rho$ between any two effect sizes in the same study is the same, across all pairs and all studies.
+
+### Variance-covariance structure
+
+The marginal variance-covariance matrix under the CE model is:
+
+$$
+\boldsymbol{\Phi}_j^{CE} = \left(\tau^2 + \rho \bar{s}_j^2\right)\mathbf{J}_j + (1 - \rho)\bar{s}_j^2\,\mathbf{I}_j
+$$ {#eq-phi-ce}
+
+This is a compound symmetric matrix: all diagonal entries equal $\tau^2 + \bar{s}_j^2$ and all off-diagonal entries equal $\tau^2 + \rho \bar{s}_j^2$. Its inverse is:
+
+$$
+\left(\boldsymbol{\Phi}_j^{CE}\right)^{-1} = \frac{1}{(1-\rho)\bar{s}_j^2}\left[\mathbf{I}_j - q_j\mathbf{J}_j\right]
+$$ {#eq-phi-ce-inv}
+
+where $q_j = \frac{\tau^2 + \rho \bar{s}_j^2}{(\tau^2 + \rho \bar{s}_j^2)n_j + (1-\rho)\bar{s}_j^2}$.
+
+### Semi-efficient weights
+
+The approximately efficient weights for the CE model give every effect size in a study the same weight:
+
+$$
+w_{ij} = \frac{1}{n_j(\hat{\tau}^2 + \bar{s}_j^2)}
+$$ {#eq-w-ce}
+
+This has an appealing interpretation: the total weight for study $j$ is $n_j \times w_{ij} = 1/(\hat{\tau}^2 + \bar{s}_j^2)$, which is divided equally among all $n_j$ effect sizes. The variance component $\tau^2$ is estimated using a closed-form method-of-moments estimator that depends on the assumed correlation $\rho$ (conventionally set to $\rho = 0.80$).
+
+::: {.callout-note}
+## Intuition: dependence through correlated sampling errors
+
+The CE model says: "Effect sizes within a study are correlated because they are estimated from the *same sample*, producing correlated estimation errors. But the underlying true effects are all identical." This is appropriate when a single study measures the same construct in multiple ways --- for example, reporting effects on several related outcome measures at the same time point.
+:::
+
+
+## Model 3: Correlated and hierarchical effects (CHE) {#sec-che}
+
+In practice, meta-analytic data rarely have a purely hierarchical or purely correlated structure. The correlated-and-hierarchical effects (CHE) model, introduced by @pustejovsky2022, combines both sources of dependence:
+
+$$
+T_{ij} = \mathbf{x}_{ij}\boldsymbol{\beta} + u_j + v_{ij} + e_{ij}
+$$ {#eq-che}
+
+where $\text{Var}(u_j) = \tau^2$, $\text{Var}(v_{ij}) = \omega^2$, $\text{Var}(e_{ij}) = \bar{s}_j^2$, and $\text{Cov}(e_{hj}, e_{ij}) = \rho \bar{s}_j^2$. Like the CE model, the CHE model assumes a constant sampling correlation $\rho$ and uses the average sampling variance $\bar{s}_j^2$. Like the HE model, it includes both between-study ($\tau^2$) and within-study ($\omega^2$) variance components.
+
+### Variance-covariance structure
+
+The marginal variance-covariance matrix under the CHE model is:
+
+$$
+\boldsymbol{\Phi}_j^{CHE} = \left[\tau^2 + \rho \bar{s}_j^2\right]\mathbf{J}_j + \left[\omega^2 + (1-\rho)\bar{s}_j^2\right]\mathbf{I}_j
+$$ {#eq-phi-che}
+
+This is again a compound symmetric matrix, with diagonal entries $\tau^2 + \omega^2 + \bar{s}_j^2$ and off-diagonal entries $\tau^2 + \rho \bar{s}_j^2$. Its inverse is:
+
+$$
+\left(\boldsymbol{\Phi}_j^{CHE}\right)^{-1} = \frac{1}{\omega^2 + (1-\rho)\bar{s}_j^2}\left[\mathbf{I}_j - \tilde{q}_j\mathbf{J}_j\right]
+$$ {#eq-phi-che-inv}
+
+where $\tilde{q}_j = \frac{\tau^2 + \rho \bar{s}_j^2}{(\tau^2 + \rho \bar{s}_j^2)n_j + \omega^2 + (1-\rho)\bar{s}_j^2}$.
+
+Notice how @eq-phi-che nests both previous models. Setting $\omega^2 = 0$ recovers $\boldsymbol{\Phi}_j^{CE}$. Setting $\rho = 0$ and replacing $\bar{s}_j^2$ with the individual $s_{ij}^2$ recovers $\boldsymbol{\Phi}_j^{HE}$.
+
+### Fully inverse-variance weights
+
+A critical difference from the HE and CE models is that @pustejovsky2022 propose using *fully inverse-variance weights* for the CHE model:
+
+$$
+\mathbf{W}_j^{CHE} = \left(\hat{\boldsymbol{\Phi}}_j^{CHE}\right)^{-1}
+$$ {#eq-w-che}
+
+where $\hat{\boldsymbol{\Phi}}_j^{CHE}$ is computed by substituting REML estimates of $\tau^2$ and $\omega^2$ into @eq-phi-che. Unlike the diagonal weights of HE and CE, these weight matrices have non-zero off-diagonal entries, which means the weights for individual effect sizes within a study depend on *all* the other effect sizes in that study.
+
+### REML estimation of variance components
+
+The CHE model uses restricted maximum likelihood (REML) to estimate both $\tau^2$ and $\omega^2$, rather than the method-of-moments estimators used for HE and CE. This is implemented via the `metafor::rma.mv()` function with a multivariate random-effects structure. REML estimation is generally more efficient than moment estimation when the working model is close to correctly specified.
+
+### Why CHE is the "first choice" working model
+
+@pustejovsky2022 recommend the CHE model as the default working model for several reasons:
+
+1. **Generality.** It captures both sources of dependence that commonly arise in practice --- shared study characteristics *and* correlated sampling errors.
+2. **Nesting.** It includes HE and CE as special cases, so it can approximate either structure when one dominates.
+3. **Fully inverse-variance weights.** Combined with REML estimation, these weights can yield substantial efficiency gains over the diagonal weights of HE and CE.
+4. **Robustness.** Even when the CHE model is misspecified, RVE ensures valid inference.
+
+::: {.callout-note}
+## Intuition: both sources of dependence
+
+The CHE model says: "Effect sizes within a study are correlated for *two* reasons --- they share a common study-level shift $u_j$ (like HE) *and* they have correlated estimation errors because they come from the same sample (like CE). On top of this, individual true effects can vary within the study ($v_{ij}$)." This is appropriate for the typical meta-analysis where studies report multiple outcomes, measured on the same participants, with some genuine variation in effects across outcomes.
+:::
+
+
+## Approximately efficient vs. fully inverse-variance weights {#sec-weight-comparison}
+
+The distinction between approximately efficient weights (used with HE and CE) and fully inverse-variance weights (used with CHE) is one of the central contributions of @pustejovsky2022. Understanding this difference is essential for interpreting the simulation results in later chapters.
+
+### Diagonal vs. full weight matrices
+
+The HE and CE weights are *diagonal* matrices: each effect size receives a weight that depends only on its own variance, ignoring the covariance between effect sizes within the same study. This simplification was motivated by computational convenience --- @hedges2010 designed these weights to avoid matrix inversion. But diagonal weights are not inverse-variance weights, even when the variance components are known exactly. The true inverse-variance weights (i.e., $\boldsymbol{\Phi}_j^{-1}$) have off-diagonal entries that account for the correlation structure within studies.
+
+### Why fully inverse-variance matters
+
+Fully inverse-variance weights achieve two things that diagonal weights cannot:
+
+1. **Optimal information extraction.** When effect sizes within a study are positively correlated, their information content is partially redundant. Fully inverse-variance weights "down-weight" this redundancy appropriately, extracting the maximum amount of independent information from each study.
+2. **Borrowing strength across effect sizes.** The off-diagonal terms allow information from one effect size to sharpen inference about another, particularly when the within-study structure is well-captured by the working model.
+
+The practical consequence is that fully inverse-variance weights can produce substantially smaller standard errors than diagonal weights, especially when studies contribute many correlated effect sizes. In the @pustejovsky2022 analysis of the @tannersmiths2015 data, the efficiency gains were most pronounced for within-study predictors like dependent variable type, where the CHE model with inverse-variance weights produced noticeably more precise estimates than the CE model with diagonal weights. For between-study predictors like control group type, the differences were more modest. The supplementary analysis in Section S4.2 of @pustejovsky2022 disentangles these gains, showing that fully inverse-variance weighting and REML estimation each contribute to the improvement.
+
+### The trade-off
+
+Fully inverse-variance weights come with a potential downside: if the working model is severely misspecified, the off-diagonal weight entries could *reduce* efficiency rather than improve it, because they impose a dependence structure that does not match the data. However, even in such cases, RVE standard errors remain valid. The simulation study in @pustejovsky2022 systematically evaluates this trade-off across a range of data-generating conditions, and we will replicate those findings in later chapters.
+
+
+## Model 4: Subgroup correlated effects (SCE) {#sec-sce}
+
+When a meta-analytic database includes multiple categories of effect sizes (e.g., different outcome domains), analysts often run *separate* meta-regressions within each category. This is conceptually clear but creates two problems: (a) each sub-analysis has a reduced sample size, and (b) there is no principled way to compare average effects across categories, because the sub-group estimates share overlapping sets of studies and are therefore not independent.
+
+The subgroup correlated effects (SCE) working model proposed by @pustejovsky2022 solves both problems by embedding the separate meta-regressions into a single model for the full data. Suppose every effect size falls into one of $C$ categories, and define category indicators $d_{ij}^c$ such that $d_{ij}^c = 1$ if effect size $i$ in study $j$ belongs to category $c$, with $d_{ij}^c = 0$ otherwise. The SCE model is:
+
+$$
+T_{ij} = \sum_{c=1}^{C} d_{ij}^c \left(\mathbf{x}_{ij}\boldsymbol{\beta}_c + u_{cj}\right) + e_{ij}
+$$ {#eq-sce}
+
+where $\text{Var}(u_{cj}) = \tau_c^2$ and, critically, $\text{Cov}(u_{bj}, u_{cj}) = 0$ for $b \neq c$. The sampling errors follow a "constant sampling correlation *within* subgroups" assumption:
+
+$$
+\text{Cov}(e_{hj}, e_{ij}) = \rho\, \bar{s}_j^2 \sum_{c=1}^{C} d_{hj}^c\, d_{ij}^c
+$$ {#eq-sce-corr}
+
+That is, two effect sizes from the same study are correlated only if they belong to the same category.
+
+### Variance-covariance structure
+
+Let $\mathbf{D}_j$ be the $n_j \times C$ matrix of category indicators for study $j$ (row $i$, column $c$ equals $d_{ij}^c$), and let $\boldsymbol{\Theta}_{ID} = \text{diag}(\tau_1^2, \ldots, \tau_C^2)$. The marginal variance-covariance matrix under the SCE model is:
+
+$$
+\boldsymbol{\Phi}_j^{SCE} = \mathbf{D}_j\left[\boldsymbol{\Theta}_{ID} + \rho\, \bar{s}_j^2\, \mathbf{I}_C\right]\mathbf{D}_j' + (1 - \rho)\,\bar{s}_j^2\,\mathbf{I}_j
+$$ {#eq-phi-sce}
+
+The inverse has a convenient closed form:
+
+$$
+\left(\boldsymbol{\Phi}_j^{SCE}\right)^{-1} = \frac{1}{(1-\rho)\,\bar{s}_j^2}\left[\mathbf{I}_j - \mathbf{D}_j\,\mathbf{Q}_j\,\mathbf{D}_j'\right]
+$$ {#eq-phi-sce-inv}
+
+where $\mathbf{Q}_j = \text{diag}(q_1, \ldots, q_C)$ is a $C \times C$ diagonal matrix with entries:
+
+$$
+q_c = \frac{\tau_c^2 + \rho\, \bar{s}_j^2}{(\tau_c^2 + \rho\, \bar{s}_j^2)\,n_j^c + (1-\rho)\,\bar{s}_j^2}
+$$
+
+and $n_j^c = \sum_{i=1}^{n_j} d_{ij}^c$ is the number of effect sizes from study $j$ in category $c$.
+
+### Fully inverse-variance weights
+
+As with the CHE model, the SCE model uses fully inverse-variance weights $\mathbf{W}_j^{SCE} = \left(\hat{\boldsymbol{\Phi}}_j^{SCE}\right)^{-1}$, with REML estimates of the category-specific variance components $\tau_1^2, \ldots, \tau_C^2$ substituted into @eq-phi-sce. A key structural feature is that the weight matrices have non-zero off-diagonal entries *only* for pairs of effect sizes within the same category. Pairs from different categories receive zero off-diagonal weight, which means the SCE weights are equivalent to applying the CE working model with fully inverse-variance weights separately to each subgroup.
+
+::: {.callout-note}
+## SCE = separate subgroup analyses done right
+
+The SCE model produces estimates of $\boldsymbol{\beta}_1, \ldots, \boldsymbol{\beta}_C$ and $\tau_1^2, \ldots, \tau_C^2$ that are *identical* to those from running $C$ separate meta-regressions. The advantage is that embedding them in a single model allows testable contrasts across categories --- for example, testing whether the average effect differs between outcome domains, or whether a moderator operates differently across subgroups. These contrasts use RVE standard errors that correctly account for the dependence among subgroup estimates arising from overlapping study sets.
+:::
+
+
+## Model 5: Correlated multivariate effects (CMVE) {#sec-cmve}
+
+The correlated multivariate effects (CMVE) model extends the SCE model by allowing *cross-category correlations* among the random effects. While the SCE model assumes $\text{Cov}(u_{bj}, u_{cj}) = 0$ for $b \neq c$, the CMVE model specifies:
+
+$$
+\text{Var}(u_{cj}) = \xi_c^2\,\tau^2, \qquad \text{Cov}(u_{bj}, u_{cj}) = \psi\,\xi_b\,\xi_c\,\tau^2
+$$ {#eq-cmve}
+
+where $\xi_c$ is a category-specific scaling factor and $\psi$ is a common correlation across random effects from different categories. This structure is quite discrepant from both the CE and CHE models because (a) heterogeneity varies by category, with category-specific scaling factors $\xi_c$ applied to the study-level variance $\tau^2$, (b) these correlated random effects are all at the study level (there is no separate effect-level random component), and (c) cross-category correlation $\psi$ induces dependence between effects from different categories within the same study.
+
+In the @pustejovsky2022 simulation study, the CMVE model appears as a **data-generating process** but *not* as an estimation method. The reason is practical: the CMVE model has too many parameters ($\tau^2$, $\xi_1, \ldots, \xi_C$, and $\psi$) to estimate reliably from typical meta-analytic data. Instead, its role in the simulation is to provide a severely misspecified condition for assessing the robustness of the CE, CHE, and SCE working models. When data are generated under CMVE but analyzed with one of the simpler working models, RVE inference remains valid --- coverage rates stay near the nominal 95% level --- even though the working model is substantially wrong.
+
+::: {.callout-tip}
+## CMVE in the simulation design
+
+When you encounter CMVE in later chapters on the simulation, remember: it is the stress test. If CHE and SCE produce valid inference even when the true DGP is CMVE, that is strong evidence for the practical robustness of these working models.
+:::
+
+
+## The decision tree {#sec-decision-tree}
+
+@pustejovsky2022 provide a decision tree (their Figure 1) for selecting a working model before analysis begins. The logic involves three sequential decisions:
+
+1. **Within-study dependence structure.** Are the effect size estimates from the same study likely to have correlated sampling errors (e.g., because they are measured on the same participants)?
+    - *If no* (e.g., each effect size is from a separate sample within the study): use the **HE** model.
+    - *If yes*: proceed to the next question, using either the constant sampling correlation (C) assumption, the partially empirical correlations (PEC) assumption, or the auto-correlation (AC) assumption to specify the within-study correlation.
+
+2. **Subgroup structure.** Is there a categorical variable that defines distinct dimensions of effect sizes, with potentially different levels of heterogeneity across categories?
+    - *If yes*: use the **SCE** model.
+    - *If no*: are there both within-study *and* between-study sources of heterogeneity?
+        - *If yes*: use the **CHE** model.
+        - *If no* (i.e., within-study heterogeneity is negligible): use the **CE** model.
+
+3. **Additional hierarchical groupings.** Are studies nested within higher-level clusters (e.g., research labs, countries)?
+    - *If yes*: add a level to the chosen model (e.g., CHE becomes CHE+).
+
+The key practical recommendation from @pustejovsky2022 is to choose the working model based on a broad understanding of the data structure and the data-generating process --- *not* by comparing results across different working models. Ideally, the working model should be pre-registered during the planning stage of the meta-analysis.
+
+@fig-decision-tree visualizes this decision process as a flowchart. Following the paper's Figure 1, the tree involves three decisions: (1) choosing a within-study correlation structure, (2) identifying the random effects structure, and (3) determining whether additional hierarchical levels are needed.
+
+```{mermaid}
+%%| label: fig-decision-tree
+%%| fig-cap: "Decision tree for selecting a working model (adapted from Figure 1 of Pustejovsky & Tipton, 2022). The three decision nodes correspond to the paper's three-step selection process."
+%%| fig-width: 8
+flowchart TD
+  D1{"<b>Decision 1</b><br/>Within-study ES<br/>correlation structure?"}
+
+  D1 -- "Constant (C)" --> D2
+  D1 -- "Auto-corr (AC)" --> D2
+  D1 -- "Partial empirical (PE)" --> D2
+
+  D2{"<b>Decision 2</b><br/>Are ES within studies<br/>independent<br/>(conditional on study)?"}
+
+  D2 -- "Yes" --> HE["<b>HE</b><br/>Hierarchical Effects"]
+  D2 -- "No: correlated<br/>within study" --> D2b{"Within-study<br/>heterogeneity<br/>in true effects?"}
+
+  D2b -- "No" --> CE["<b>CE</b><br/>Correlated Effects"]
+  D2b -- "Yes" --> D2c{"Distinct subgroups<br/>of effect sizes?"}
+
+  D2c -- "No" --> CHE["<b>CHE</b><br/>Correlated + Hierarchical"]
+  D2c -- "Yes" --> SCE["<b>SCE</b><br/>Subgroup Correlated"]
+
+  HE --> D3{"<b>Decision 3</b><br/>Additional hierarchical<br/>levels (e.g., labs)?"}
+  CE --> D3
+  CHE --> D3
+  SCE --> D3
+
+  D3 -- "No" --> Done["Apply CR2 robust<br/>inference"]
+  D3 -- "Yes" --> Plus["Add levels<br/>(e.g., CHE+)"]
+
+  style HE fill:#9467bd,color:#fff,stroke:#7b4f9e
+  style CE fill:#4e79a7,color:#fff,stroke:#2d5f8a
+  style CHE fill:#59a14f,color:#fff,stroke:#3d7a35
+  style SCE fill:#f28e2b,color:#fff,stroke:#c47020
+  style Done fill:#76b7b2,color:#fff,stroke:#4d918c
+  style Plus fill:#76b7b2,color:#fff,stroke:#4d918c
+  style D1 fill:#fff,stroke:#333,stroke-width:2px
+  style D2 fill:#fff,stroke:#333,stroke-width:2px
+  style D2b fill:#fff,stroke:#333,stroke-width:2px
+  style D2c fill:#fff,stroke:#333,stroke-width:2px
+  style D3 fill:#fff,stroke:#333,stroke-width:2px
+```
+
+::: {.callout-tip}
+## Default recommendation
+
+When in doubt, @pustejovsky2022 recommend the **CHE** model as the default working model. It captures both sources of dependence (hierarchical and correlated), uses fully inverse-variance weights with REML estimation, and nests the simpler HE and CE models as special cases.
+:::
+
+
+## Summary: comparing the working models {#sec-models-summary}
+
+@tbl-model-comparison summarizes the five working models developed in this chapter.
+
+| Model | Random effects | Variance components | Weight structure | Estimation | When to use |
+|:------|:---------------|:--------------------|:-----------------|:-----------|:------------|
+| HE | $u_j + v_{ij}$ | $\tau^2, \omega^2$ | Diagonal (approx.) | MoM | Independent samples within studies |
+| CE | $u_j$ | $\tau^2$ | Diagonal (approx.) | MoM | Correlated sampling errors, no within-study heterogeneity |
+| CHE | $u_j + v_{ij}$ | $\tau^2, \omega^2$ | Full inverse-variance | REML | Both sources of dependence (default) |
+| SCE | $\sum_c d_{ij}^c u_{cj}$ | $\tau_1^2, \ldots, \tau_C^2$ | Full inverse-variance | REML | Categorical subgroups with distinct heterogeneity |
+| CMVE | $\sum_c d_{ij}^c u_{cj}$ (correlated) | $\tau^2, \xi_c^2, \psi$ | Not used for estimation | --- | DGP only (simulation stress test) |
+
+: Comparison of working models. MoM = method of moments; REML = restricted maximum likelihood; DGP = data-generating process. {#tbl-model-comparison}
+
+Three key takeaways emerge from this chapter:
+
+1. **Validity is guaranteed by RVE, not by the working model.** All five working models produce valid inference when paired with robust variance estimation, even under misspecification. The working model affects *efficiency*, not *validity*.
+2. **Fully inverse-variance weights improve efficiency.** The CHE and SCE models, which use full $\boldsymbol{\Phi}_j^{-1}$ weights with REML estimation, can yield substantially more precise estimates than the diagonal-weight HE and CE models, particularly for within-study predictors.
+3. **Choose the working model before looking at results.** The decision tree provides a principled, pre-registrable framework for selecting a working model based on the structure of the data, not on which model produces the most favorable results.

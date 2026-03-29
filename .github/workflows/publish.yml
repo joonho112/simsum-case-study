@@ -1,0 +1,57 @@
+on:
+  push:
+    branches: main
+
+name: Render and Publish
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Quarto
+        uses: quarto-dev/quarto-actions/setup@v2
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          use-public-rspm: true
+
+      - name: Install R packages
+        uses: r-lib/actions/setup-r-dependencies@v2
+        with:
+          packages: |
+            any::simhelpers
+            any::rsimsum
+            any::metafor
+            any::clubSandwich
+            any::robumeta
+            any::ggplot2
+            any::dplyr
+            any::tidyr
+            any::purrr
+            any::knitr
+            any::ggridges
+            any::mvtnorm
+
+      - name: Render Quarto Book
+        uses: quarto-dev/quarto-actions/render@v2
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _book
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

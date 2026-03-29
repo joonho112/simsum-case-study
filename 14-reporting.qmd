@@ -1,0 +1,249 @@
+# Reporting the Replication {#sec-reporting}
+
+```{r}
+#| label: setup-reporting
+#| include: false
+source("_common.R")
+```
+
+```{r}
+#| label: load-utils
+#| include: false
+source("R/utils-results.R")
+```
+
+This final chapter steps back from the technical implementation and asks: *how should a simulation study be communicated?* We apply the ADEMP reporting checklist to assess @pustejovsky2022, demonstrate best practices for presenting Monte Carlo standard errors, build publication-ready tables from our replication data, and distill lessons learned across the course.
+
+## The ADEMP reporting checklist applied to P&T (2022) {#sec-ademp-checklist}
+
+@morris2019 designed the ADEMP framework not only for planning simulations but also for reporting them. Each component maps to a question a reader should be able to answer after reading the paper. We walk through each in turn, assessing @pustejovsky2022 against this standard.
+
+**Aims.** The paper clearly states four research questions in Section 5: relative efficiency of CHE and SCE versus CE, CI calibration under model misspecification, variance component accuracy, and robustness. A reader knows exactly what the simulation is designed to evaluate. *Verdict: fully reported.*
+
+**Data-generating mechanisms.** The DGP is described in Supplementary Section S5, including the three random-effects structures (CE, CHE, CMVE), the real-data calibration strategy from the @tannersmiths2015 dataset, and the full factorial crossing of design factors ($J$, $\tau$, $\omega$, $\bar{\rho}$). The code on OSF implements these specifications transparently. *Verdict: fully reported.*
+
+**Estimands.** The estimands are the meta-regression coefficients $\boldsymbol{\beta}$ and variance components ($\tau^2$, $\omega^2$). These are defined implicitly through the DGP and the performance metrics that target them. *Verdict: adequately reported.*
+
+**Methods.** Three estimation methods (CE via `robumeta`, CHE and SCE via `metafor`) are described with enough detail to reimplement. The OSF repository provides the exact R code. *Verdict: fully reported, with code.*
+
+**Performance measures.** Bias, RMSE, coverage, and CI width are all reported. However, **Monte Carlo standard errors are not reported** for any performance metric. This is the single notable gap: without MCSEs, a reader cannot judge whether observed differences between methods reflect genuine performance gaps or Monte Carlo noise. As @morris2019 and @burton2006 emphasize, MCSEs are essential for interpreting simulation results. *Verdict: metrics reported, but MCSEs missing.*
+
+::: {.callout-note}
+## Credit where due
+@pustejovsky2022 score well on the ADEMP checklist overall. The combination of a clear research question, real-data calibration, open code, and open results files places the study above the median for methodological transparency in the simulation literature. The MCSE gap is common in the field and reflects established norms rather than an oversight.
+:::
+
+
+## MCSE reporting formats {#sec-mcse-formats}
+
+@morris2019 recommend three formats for presenting MCSEs alongside performance estimates. Each has strengths depending on the context.
+
+**Parenthetical format.** Report the MCSE in parentheses after the estimate, analogous to reporting a standard error:
+
+> Bias = 0.017 (MCSE = 0.005)
+
+This is compact and works well in running text or when a single result is highlighted.
+
+**Bracketed CI format.** Construct a 95% Monte Carlo confidence interval and report it in brackets:
+
+> Bias = 0.017 [0.007, 0.027]
+
+This format immediately communicates whether zero (or any other reference value) falls within the interval, making it easier for readers to judge practical significance.
+
+**Separate column format.** In tables, add a dedicated column for the MCSE next to each performance metric. This is the most systematic approach for presenting results across many conditions.
+
+```{r}
+#| label: load-reporting-data
+
+load("data/RVE-simulation-dvcat-results.Rdata")
+dvcat_raw <- results
+load("data/RVE-simulation-Ctype-results.Rdata")
+ctype_raw <- results
+rm(results)
+
+dvcat_agg <- aggregate_batches(dvcat_raw) |> add_labels()
+ctype_agg <- aggregate_batches(ctype_raw) |> add_labels()
+```
+
+Here is an example using the separate-column format for a single condition. Because we work from P&T's pre-summarized batch outputs rather than iteration-level data, the MCSEs shown are **approximate** --- derived from aggregated summaries as described in @sec-ademp-blueprint.
+
+```{r}
+#| label: tbl-mcse-example
+#| tbl-cap: "Performance metrics with MCSEs for dv_catBAC (J = 60, CE DGP, tau = 0.1, rho = 0.6)."
+
+dvcat_agg |>
+  filter(coef == "dv_catBAC", n_studies == 60,
+         struct == "CS", tau == 0.1, omega == 0, rho == 0.6) |>
+  transmute(
+    Method = method,
+    Bias = sprintf("%.4f", bias),
+    `MCSE(Bias)` = sprintf("%.4f", mcse_bias),
+    RMSE = sprintf("%.4f", rmse),
+    Coverage = sprintf("%.3f", cover),
+    `MCSE(Cov)` = sprintf("%.4f", mcse_cover)
+  ) |>
+  kable(align = "lccccc")
+```
+
+With over 4,000 iterations, the MCSEs are small enough that inter-method differences in bias and coverage can be interpreted with confidence.
+
+
+## Table templates {#sec-table-templates}
+
+Publication-ready tables serve two complementary purposes: comparing methods within a single DGP, and comparing a single method across DGPs. We demonstrate both formats.
+
+### Table A: Single DGP, multiple methods {#sec-table-a}
+
+This format is useful for the paper's core question: how do the three working models compare under a specific data-generating process? We select the CHE DGP with $J = 60$ and $\tau = 0.1$, averaging across focal dvcat coefficients within each condition.
+
+```{r}
+#| label: tbl-single-dgp
+#| tbl-cap: "Performance of CE, CHE, and SCE under the CHE DGP (J = 60, tau = 0.1), averaged across dvcat focal coefficients."
+#| code-fold: true
+#| code-summary: "Table A generation code"
+
+dvcat_focal <- dvcat_agg |>
+  filter(grepl("^dv_cat", coef))
+
+table_a <- dvcat_focal |>
+  filter(n_studies == 60, struct == "CS", omega == 0.10, tau == 0.1) |>
+  group_by(method, rho) |>
+  summarize(
+    Bias = mean(bias),
+    RMSE = mean(rmse),
+    Coverage = mean(cover),
+    .groups = "drop"
+  ) |>
+  mutate(
+    Bias = sprintf("%.4f", Bias),
+    RMSE = sprintf("%.4f", RMSE),
+    Coverage = sprintf("%.3f", Coverage),
+    rho = sprintf("%.1f", rho)
+  )
+
+table_a |>
+  kable(
+    col.names = c("Method", "rho", "Bias", "RMSE", "Coverage"),
+    align = "llccc"
+  )
+```
+
+### Table B: Multiple DGPs, single method {#sec-table-b}
+
+This format answers the robustness question: how does a single method perform when the DGP changes? We focus on CHE estimation across all three DGPs.
+
+```{r}
+#| label: tbl-multi-dgp
+#| tbl-cap: "CHE performance across CE, CHE, and CMVE DGPs (J = 60, tau = 0.1), averaged across dvcat focal coefficients."
+#| code-fold: true
+#| code-summary: "Table B generation code"
+
+table_b <- dvcat_focal |>
+  filter(n_studies == 60, tau == 0.1, method == "CHE") |>
+  group_by(dgp, rho) |>
+  summarize(
+    Bias = mean(bias),
+    RMSE = mean(rmse),
+    Coverage = mean(cover),
+    .groups = "drop"
+  ) |>
+  mutate(
+    Bias = sprintf("%.4f", Bias),
+    RMSE = sprintf("%.4f", RMSE),
+    Coverage = sprintf("%.3f", Coverage),
+    rho = sprintf("%.1f", rho)
+  )
+
+table_b |>
+  kable(
+    col.names = c("DGP", "rho", "Bias", "RMSE", "Coverage"),
+    align = "llccc"
+  )
+```
+
+
+## What to report and what to fold {#sec-code-visibility}
+
+A Quarto book about a simulation study faces a tension: readers need to see enough code to understand and reproduce the analysis, but too much code obscures the narrative. The guiding principle is to **show code that teaches and fold code that merely processes**.
+
+**Always show:**
+
+- The data-generating function (the scientific core of the simulation)
+- The estimation step (which methods are applied and how)
+- The performance metric computation (so readers can verify the definitions)
+
+**Fold or hide:**
+
+- Data loading and wrangling (important for reproducibility but not for understanding)
+- Long table formatting (column renaming, sprintf calls, pivot operations)
+- Package loading and global options
+
+Quarto's `code-fold` option makes this easy. Set `code-fold: true` in the YAML header or on individual chunks to create collapsible code blocks. Readers who want the full implementation can expand them; readers focused on the narrative can skip past.
+
+```yaml
+# In _quarto.yml or chapter YAML
+format:
+  html:
+    code-fold: true
+    code-summary: "Show code"
+```
+
+For long output tables, `code-overflow: scroll` or pagination (via the DT package) prevents a single table from dominating the page.
+
+
+## Lessons learned from this replication {#sec-lessons}
+
+This course set out to replicate the simulation study in @pustejovsky2022 while teaching simulation methodology. Several cross-cutting lessons emerged.
+
+**The DSR framework provides modularity.** The Design--Simulate--Report workflow from @miratrixpustejovsky2024 gave us a clear separation between generating data, applying methods, and evaluating results. Each step could be developed and debugged independently, and the factorial design was explicit rather than buried in nested loops.
+
+**simhelpers excels at bundled MCSEs.** The `simhelpers` package [@simhelpers] computes performance metrics with MCSEs in a single call, making it difficult to accidentally omit them. If iteration-level data are available, `simhelpers` is the most direct path to a complete performance summary.
+
+**rsimsum excels at quick diagnostics.** The `rsimsum` package [@gasparini2018] provides `autoplot()` for rapid visual checks of bias, coverage, and other metrics. Its `tidy()` method produces data frames that slot directly into ggplot2 workflows. For studies that store iteration-level data, rsimsum offers a productive exploratory pipeline.
+
+**Open science made this replication possible.** Without the OSF repository --- containing both the simulation code and the `.Rdata` result files --- this replication course could not exist. The ability to load the exact output files, verify them against the published figures, and then build new analyses on top of them demonstrates the compounding value of open materials.
+
+**Iteration-level data would have been better.** The single most limiting factor was that @pustejovsky2022 stored batch-level summaries rather than iteration-level estimates. This prevented us from computing exact MCSEs, running rsimsum's `simsum()` directly, or exploring the distributional properties of the estimators. Storing iteration-level data --- even compressed --- would have cost little in storage but gained much in analytical flexibility.
+
+
+### A note on the simhelpers--rsimsum complementarity
+
+Throughout this course, we have presented `simhelpers` as the primary framework and `rsimsum` as a secondary comparison. In practice, the two packages serve different roles that make them more complementary than competing. The ideal workflow uses `simhelpers` for the *upstream* phase (bundling the DGP and analysis functions, managing iteration and parallelization, computing performance metrics with MCSEs) and `rsimsum` for the *downstream* phase (producing fast diagnostic visualizations with `autoplot()` (editable ggplot objects), computing additional diagnostic metrics like bias-eliminated coverage, and generating tidy summary tables). The handoff point is the iteration-level results tibble: `simhelpers` produces it, `rsimsum` consumes it. In this replication, the handoff was complicated by the pre-summarized nature of the P&T results, which limited our ability to demonstrate `rsimsum`'s full capabilities. In a new simulation built from scratch, the complementary workflow would be fully realized.
+
+
+## Recommendations for future simulation studies {#sec-recommendations}
+
+Drawing on @morris2019, @burton2006, and @siepe2024, we offer six concrete recommendations.
+
+1. **Store iteration-level data.** Save one row per replication with the point estimate, standard error, and confidence interval bounds. Compress with `saveRDS()` or Arrow/Parquet. Summary statistics can always be recomputed; raw iterations cannot be recovered once discarded.
+
+2. **Always report MCSEs.** Every performance metric in every table should be accompanied by its Monte Carlo standard error, using one of the three formats described in @sec-mcse-formats. MCSEs make the precision of the simulation explicit and prevent over-interpretation of small differences.
+
+3. **Use the ADEMP framework for planning and reporting.** Begin the study by filling in the five ADEMP components. Use the same structure to organize the methods section of the paper. This ensures nothing is omitted and gives readers a predictable navigation path.
+
+4. **Make code and data available.** Deposit simulation code, result files, and analysis scripts in a public repository (OSF, GitHub, Zenodo). Version the code so that future readers can match results to the exact software state that produced them.
+
+5. **Consider preregistration.** @siepe2024 argue that simulation studies benefit from preregistration just as empirical studies do. Specifying the design, estimands, and performance metrics before running the simulation guards against post-hoc rationalization of unexpected results.
+
+6. **Document the full software stack.** Record R version, package versions (via `sessionInfo()` or `renv`), and operating system. Simulation results can be sensitive to numerical precision, random number generation, and package updates.
+
+::: {.callout-tip}
+## A minimal checklist
+Before submitting a simulation paper, verify: (1) Can a reader identify all five ADEMP components? (2) Does every performance metric have an MCSE? (3) Is the code publicly available? If any answer is no, the manuscript is not yet ready.
+:::
+
+
+## Summary
+
+This chapter applied the ADEMP reporting framework as a retrospective audit of @pustejovsky2022, finding strong compliance on four of five dimensions and identifying the absence of MCSEs as the primary gap. We demonstrated three formats for presenting MCSEs [@morris2019], built two publication-ready table templates from the replication data, and discussed when to show versus fold code in a Quarto document. The lessons learned across this course --- the value of modular workflows, bundled MCSE computation, and open science practices --- point toward a set of concrete recommendations for future simulation studies.
+
+
+## Exercises {.unnumbered}
+
+::: {.callout-caution title="Exercise 14.1: Write a results paragraph"}
+Choose one data-generating condition (e.g., CHE DGP, $J = 60$, $\tau = 0.10$, $\bar{\rho} = 0.6$) and write a 3--4 sentence results paragraph for a journal article. Include point estimates of relative RMSE for CHE and SCE versus CE, with approximate MCSEs. Follow the reporting guidelines discussed in this chapter.
+
+::: {.callout-tip title="Hint" collapse="true"}
+Use the aggregated results from @sec-metrics. A template: 'Under the [DGP] data-generating process with $J = [N]$ studies and $\tau = [value]$, the CHE working model reduced RMSE by [X]% relative to the CE baseline (relative RMSE = [value]). The SCE model showed a more modest improvement of [Y]%. Coverage rates remained close to the nominal 95% level for all three models ([range]).'
+:::
+:::

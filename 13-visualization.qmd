@@ -1,0 +1,291 @@
+# Visualizing Simulation Results {#sec-visualization}
+
+```{r}
+#| label: setup-visualization
+#| include: false
+source("_common.R")
+```
+
+```{r}
+#| label: load-utils
+#| include: false
+source("R/utils-results.R")
+```
+
+Chapter 12 reproduced the paper's Figures S6--S11: relative RMSE line plots and coverage box plots. Those figures answered the paper's core questions, but a Monte Carlo study with a full factorial design contains far more information than six figures can convey. This chapter builds a visualization gallery that goes beyond the published figures, using custom ggplot2 code to interrogate the results from new angles.
+
+## The visualization toolkit {#sec-viz-toolkit}
+
+Two complementary philosophies exist for plotting simulation results. The DSR (Design--Simulate--Report) approach championed by @miratrixpustejovsky2024 treats simulation output as any other tidy dataset: load it into R, wrangle with dplyr, and build plots with ggplot2. Every aesthetic choice is explicit, which makes the workflow transparent and infinitely customizable. The rsimsum package [@gasparini2018] offers a higher-level `autoplot()` API that produces publication-ready figures from a single function call---but it expects iteration-level data (one row per replication), not pre-summarized results.
+
+Since the @pustejovsky2022 results ship as batch-level summaries (one row per batch $\times$ condition $\times$ model $\times$ coefficient), rsimsum's `autoplot()` cannot be applied directly. We therefore focus entirely on the ggplot2 custom-build approach, which is also the more instructive path for learners.
+
+## Data preparation {#sec-viz-data}
+
+We reuse the aggregation and labeling pipeline from @sec-verification.
+
+```{r}
+#| label: viz-load-data
+
+load("data/RVE-simulation-dvcat-results.Rdata")
+dvcat_raw <- results
+load("data/RVE-simulation-Ctype-results.Rdata")
+ctype_raw <- results
+rm(results)
+
+dvcat_agg <- aggregate_batches(dvcat_raw) |> add_labels()
+ctype_agg <- aggregate_batches(ctype_raw) |> add_labels()
+
+dvcat_focal <- dvcat_agg |> filter(grepl("^dv_cat", coef))
+ctype_focal <- ctype_agg |> filter(grepl("^Ctype", coef))
+```
+
+We also use a consistent color palette (defined in `R/utils-results.R`) across all plots in this chapter.
+
+
+## Heat maps: coverage across the factorial design {#sec-heatmaps}
+
+The box plots in @sec-fig-s10-s11 showed coverage distributions collapsed across conditions. A heat map restores the factorial structure, making it easy to spot whether particular corners of the design space produce under-coverage.
+
+We average coverage across the dvcat focal coefficients within each condition to produce a single coverage value per cell, then tile by $\bar{\rho}$ and $\tau$ within each method $\times$ DGP $\times$ $J$ panel.
+
+```{r}
+#| label: fig-cover-heatmap
+#| fig-cap: "Coverage heat map for dvcat focal coefficients, averaged across coefficients within each condition."
+#| fig-width: 10
+#| fig-height: 9
+
+dvcat_cover_avg <- dvcat_focal |>
+  group_by(n_studies, n_lab, tau, rho, dgp, method) |>
+  summarize(cover = mean(cover), .groups = "drop")
+
+dvcat_cover_avg |>
+  ggplot(aes(x = factor(rho), y = factor(tau), fill = cover)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(aes(label = sprintf("%.2f", cover)), size = 2.3) +
+  facet_grid(dgp + n_lab ~ method) +
+  scale_fill_gradient2(
+    midpoint = 0.95, low = "#2166ac", mid = "#f7f7f7", high = "#b2182b",
+    limits = c(0.88, 1.0),
+    name = "Coverage"
+  ) +
+  labs(
+    x = expression(bar(rho)),
+    y = expression(tau)
+  ) +
+  theme(
+    strip.text = element_text(size = 9),
+    axis.text = element_text(size = 8),
+    legend.position = "bottom"
+  )
+```
+
+The heat map reveals that coverage is remarkably uniform. The diverging color scale is centered on the 0.95 nominal level, so green tiles indicate slight over-coverage and red tiles under-coverage. Almost all cells sit within $\pm 0.02$ of the target, confirming the conclusion from @sec-fig-s10-s11 in a more granular way.
+
+When reading a coverage heat map, scan for systematic color patterns. If an entire row or column departs from the green midpoint, it suggests that a particular factor level (e.g., high $\tau$ or low $\bar{\rho}$) is driving under- or over-coverage. In this simulation, the absence of such patterns confirms that coverage is robust to the design factors.
+
+
+## Lolly plots: bias with approximate MCSE intervals {#sec-lollyplots}
+
+A lolly plot (point-and-line display) is the standard way to present bias alongside its Monte Carlo standard error (MCSE), making it clear whether an observed bias is meaningfully different from zero. Since we have pre-summarized data, we approximate the MCSE for bias as $\text{RMSE} / \sqrt{K}$, where $K$ is the total number of iterations. This is a conservative approximation that uses the RMSE as a proxy for the standard deviation of the estimator across replications.
+
+We subset to a single slice of the design ($J = 60$, $\bar{\rho} = 0.6$) to keep the plot readable.
+
+```{r}
+#| label: fig-bias-lollipop
+#| fig-cap: "Bias with approximate MCSE intervals for dvcat focal coefficients (J = 60, rho = 0.6)."
+#| fig-width: 9
+#| fig-height: 7
+
+dvcat_bias_sub <- dvcat_focal |>
+  filter(n_studies == 60, rho == 0.6) |>
+  mutate(
+    mcse_bias = rmse / sqrt(total_iters),
+    bias_lo = bias - 1.96 * mcse_bias,
+    bias_hi = bias + 1.96 * mcse_bias
+  )
+
+dvcat_bias_sub |>
+  ggplot(aes(x = coef, y = bias, color = method)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_pointrange(
+    aes(ymin = bias_lo, ymax = bias_hi),
+    position = position_dodge(width = 0.6),
+    size = 0.4, fatten = 2
+  ) +
+  facet_grid(dgp ~ tau, labeller = labeller(tau = label_both)) +
+  scale_color_manual(values = method_colors) +
+  labs(
+    x = "Coefficient",
+    y = "Bias",
+    color = "Working model"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    legend.position = "bottom"
+  )
+```
+
+The intervals are extremely tight because the design totals $R = 4{,}012$ replications (34 batches of $\approx 118$ each). The key takeaway is that all three methods are essentially unbiased for every focal coefficient---differences from zero are negligible in practical terms.
+
+The key diagnostic question for a lolly plot is whether the confidence intervals cross zero. If all intervals comfortably include zero, the estimators are unbiased for practical purposes. The length of the interval reflects the MCSE: shorter intervals mean greater confidence in the bias estimate. With $R = 4{,}012$ replications, the intervals here are tight enough to rule out even small biases.
+
+
+## Convergence visualization {#sec-convergence-viz}
+
+Among the three working models, only SCE (MV-DIAG) can fail to converge because it requires iterative estimation of the variance component structure. CE (robu) uses method-of-moments and so always converges. CHE uses REML estimation via `metafor::rma.mv()`, but always converges in this simulation because the two-variance-component nested model is relatively simple for the REML optimizer. We visualize SCE convergence rates across the full factorial design.
+
+```{r}
+#| label: fig-convergence
+#| fig-cap: "Convergence rates for SCE (MV-DIAG) across conditions, dvcat specification."
+#| fig-width: 9
+#| fig-height: 7
+
+dvcat_conv <- dvcat_agg |>
+  filter(mod == "MV-DIAG", grepl("^dv_cat", coef)) |>
+  group_by(n_studies, n_lab, tau, rho, dgp) |>
+  summarize(convergence = mean(convergence), .groups = "drop")
+
+dvcat_conv |>
+  ggplot(aes(x = factor(rho), y = factor(tau), fill = convergence)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(aes(label = sprintf("%.3f", convergence)), size = 2.5) +
+  facet_grid(dgp ~ n_lab) +
+  scale_fill_gradient(
+    low = "#fee08b", high = "#1a9850",
+    limits = c(
+      min(dvcat_conv$convergence) - 0.005, 1.0
+    ),
+    name = "Convergence rate"
+  ) +
+  labs(
+    x = expression(bar(rho)),
+    y = expression(tau)
+  ) +
+  theme(
+    strip.text = element_text(size = 10),
+    legend.position = "bottom"
+  )
+```
+
+Convergence is near-perfect across the design space. Even in the most challenging corner (small $J$, low $\tau$), rates remain above 0.99. Because the non-convergence rate is so low, the impact on SCE performance metrics is minimal.
+
+Note that the convergence rate shown here is an **upper bound** on the proportion of true REML convergences. As discussed in @sec-estimate-mv, the `cnvg` column does not distinguish between direct REML convergence and the fixed-tau2 fallback path (which also sets `cnvg = TRUE`). Furthermore, when `estimate_MV()` fails entirely, the P&T simulation replaces SCE results with CHE-based backup estimates (marked `cnvg = FALSE`). These backup estimates are included in the performance averages for bias, RMSE, and coverage --- they are not excluded or treated separately. When the convergence rate is high (as it is here), this substitution affects very few iterations and has negligible impact on the performance metrics.
+
+
+## Degrees of freedom visualization {#sec-df-viz}
+
+The Satterthwaite degrees of freedom determine how the $t$-based confidence intervals behave. Very low degrees of freedom widen the interval and signal that inference is unreliable. We visualize the distribution of mean df across conditions for each method.
+
+```{r}
+#| label: fig-df-boxplot
+#| fig-cap: "Distribution of mean Satterthwaite degrees of freedom across conditions (dvcat focal coefficients)."
+#| fig-width: 9
+#| fig-height: 6
+
+dvcat_focal |>
+  ggplot(aes(x = method, y = df_M, fill = method)) +
+  geom_boxplot(outlier.size = 0.8, alpha = 0.8) +
+  facet_grid(dgp ~ n_lab) +
+  scale_fill_manual(values = method_colors) +
+  geom_hline(yintercept = 4, linetype = "dotted", color = "red", linewidth = 0.5) +
+  annotate("text", x = 0.5, y = 4.5, label = "df = 4", color = "red",
+           hjust = 0, size = 2.5) +
+  labs(
+    x = "Working model",
+    y = "Mean Satterthwaite df",
+    fill = "Working model"
+  ) +
+  theme(legend.position = "none")
+```
+
+The red dotted line at $\text{df} = 4$ marks a conventional threshold below which $t$-based inference becomes questionable. With $J = 30$ studies, degrees of freedom are modest but generally above this threshold. As $J$ increases to 60, df grow substantially, making the $t$-based intervals more reliable. The three methods produce similar df distributions, which is expected because the Satterthwaite correction depends primarily on the number of clusters, not the working model.
+
+Satterthwaite degrees of freedom below 4 are a red flag: the $t$-based confidence intervals become unreliable, and the small-sample correction may over-correct, producing conservative inference. In practice, degrees of freedom below 4 suggest that the data do not contain enough independent clusters to support robust inference for that particular coefficient.
+
+
+## CI width comparison {#sec-width-comparison}
+
+Coverage alone does not tell the whole story: two methods can both achieve 95% coverage while one produces systematically wider (less informative) intervals. Comparing CI widths reveals the practical consequence of the efficiency gains documented in @sec-fig-s6-s7.
+
+We average width across dvcat focal coefficients and plot the result against $\bar{\rho}$, faceted by DGP and $J$.
+
+```{r}
+#| label: fig-width-comparison
+#| fig-cap: "Mean confidence interval width across dvcat focal coefficients by method, rho, DGP, and number of studies."
+#| fig-width: 9
+#| fig-height: 7
+
+dvcat_width_avg <- dvcat_focal |>
+  group_by(n_studies, n_lab, tau, rho, dgp, method) |>
+  summarize(width = mean(width), .groups = "drop")
+
+dvcat_width_avg |>
+  ggplot(aes(x = rho, y = width, color = method, shape = method)) +
+  geom_line(linewidth = 0.6) +
+  geom_point(size = 1.5) +
+  facet_grid(dgp ~ n_lab + tau,
+             labeller = labeller(tau = label_both)) +
+  scale_color_manual(values = method_colors) +
+  scale_x_continuous(breaks = c(0.2, 0.4, 0.6, 0.8)) +
+  labs(
+    x = expression(bar(rho)),
+    y = "Mean CI width",
+    color = "Working model",
+    shape = "Working model"
+  ) +
+  theme(
+    strip.text = element_text(size = 8),
+    legend.position = "bottom"
+  )
+```
+
+CHE consistently produces the narrowest confidence intervals, followed by SCE and then CE. The gap between methods widens with increasing $\bar{\rho}$, which is the same pattern seen in the RMSE ratio plots. Narrower intervals with maintained coverage mean more precise inference---the practical payoff of using a more structured working model.
+
+
+## Variance component accuracy {#sec-varcomp-viz}
+
+The preceding plots focus on regression coefficients, but a separate question is how well each method estimates the between-study variance $\tau^2$. We filter the aggregated results to the `tau2` row (excluding subgroup-specific variance components) and compare bias across the three working models.
+
+```{r}
+#| label: fig-tau2-accuracy
+#| fig-cap: "Between-study variance estimation accuracy: bias in tau-squared by working model."
+#| fig-width: 9
+#| fig-height: 6
+
+dvcat_agg |>
+  filter(coef == "tau2") |>
+  ggplot(aes(x = factor(tau), y = bias, fill = method)) +
+  geom_boxplot(position = position_dodge(width = 0.7), alpha = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  facet_grid(dgp ~ n_lab) +
+  scale_fill_manual(values = method_colors) +
+  labs(
+    x = expression(True ~ tau),
+    y = expression(Bias ~ of ~ hat(tau)^2),
+    fill = "Working model"
+  ) +
+  theme(legend.position = "bottom")
+```
+
+CHE's REML estimator of $\tau^2$ is generally less biased than CE's method-of-moments estimator, particularly when the true between-study heterogeneity is large. Under the CHE DGP---where the CHE working model is correctly specified---the REML estimate is nearly unbiased across all conditions. CE's moment estimator tends to exhibit modest positive or negative bias depending on the DGP and sample size, reflecting the fact that it does not account for the correlated-effects structure when estimating variance components.
+
+
+## Which plot for which question? {#sec-plot-guide}
+
+Different performance metrics call for different visual encodings. @tbl-plot-guide provides a decision guide for choosing the right plot type.
+
+| Question | Recommended plot | Key aesthetic |
+|:---|:---|:---|
+| Are methods differently biased? | Lolly plot (point-range) | `y = bias`, `ymin/ymax = MCSE bounds` |
+| Is coverage adequate across conditions? | Heat map | `fill = coverage`, diverging at 0.95 |
+| Which method is most efficient? | RMSE ratio line plot (@sec-fig-s6-s7) | `y = RMSE ratio`, reference at 1.0 |
+| Are confidence intervals appropriately sized? | Width comparison line plot | `y = CI width`, lines by method |
+| Does the model converge reliably? | Convergence heat map | `fill = convergence rate` |
+| Are degrees of freedom adequate? | Box plot | `y = df`, threshold line at df = 4 |
+
+: Decision guide for choosing simulation visualizations. {#tbl-plot-guide}
+
+The core principle is to match the visual encoding to the structure of the question. Heat maps work well for scanning a full factorial design for trouble spots. Line plots reveal trends across a continuous design factor. Point-range (lolly) plots are ideal when the inferential question is whether a quantity differs from a reference value. Box plots summarize distributions when the factorial structure is less important than the overall spread.
+
+All of the plots in this chapter---and in Chapter 12---follow the DSR philosophy: treat simulation output as a tidy data frame, aggregate to the level of interest, and build the plot layer by layer with ggplot2. This approach scales to any simulation study, regardless of whether the software that produced the results has a built-in plotting function.

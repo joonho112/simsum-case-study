@@ -1,0 +1,343 @@
+# Running the Simulation {#sec-execution}
+
+```{r}
+#| label: setup-execution
+#| include: false
+source("_common.R")
+```
+
+With the factorial design specified and the pipeline functions tested, we are ready for the main event: running thousands of simulation iterations across all parameter conditions. This chapter walks through the driver scripts that orchestrate execution, discusses parallel processing strategies, and --- critically for this course --- explains why you do not need to run the full simulation yourself.
+
+## Overview {#sec-exec-overview}
+
+@pustejovsky2022 run two parallel simulations, one for each empirical specification:
+
+1. **dvcat** --- driven by `RVE-simulation-dvcat.R`, using calibrated parameters from the dependent-variable-category analysis.
+2. **Ctype** --- driven by `RVE-simulation-Ctype.R`, using calibrated parameters from the control-group-type analysis.
+
+The two scripts are nearly identical. They share the same design factors, the same filtering logic, the same pipeline function (`simulate_meta()`), and the same three estimation methods. The only difference is which `.Rdata` file is loaded at the top, which determines the empirical objects (`covariates`, `studyID`, `subgroup`, `sample_sizes`, `beta`, and the variance calibration scalars) passed into the pipeline.
+
+Because the scripts are structurally identical, we will annotate `RVE-simulation-dvcat.R` in detail. Everything applies equally to the Ctype counterpart.
+
+
+## Walkthrough of the driver script {#sec-walkthrough}
+
+The driver script `R/RVE-simulation-dvcat.R` has four logical blocks. Let us trace each one.
+
+### Block 1 --- Load functions and data
+
+```{r}
+#| label: block1-load
+#| eval: false
+source("simulations/simulation-functions.R")
+load(file = "simulations/dv-model-data.Rdata")
+source_obj <- ls()
+```
+
+The `source()` call brings in all helper functions (`generate_smd()`, `generate_meta()`, `estimate_models()`, `simulate_meta()`). The `load()` call restores the calibrated empirical objects into the global environment. The `source_obj <- ls()` line captures the names of all currently loaded objects --- this list is later passed to the parallel cluster so that every worker has access to the same functions and data.
+
+### Block 2 --- Define the parameter grid
+
+```{r}
+#| label: block2-design-factors
+#| eval: false
+set.seed(20210128)
+
+design_factors <- list(
+  n_studies = c(30, 60),
+  struct = c("CS", "HCS"),
+  tau = c(0.05, 0.10, 0.20),
+  omega = c(0.00, 0.10),
+  rho = c(0.2, 0.4, 0.6, 0.8),
+  nu = 9
+)
+
+batches <- 34
+total_reps <- 4012
+```
+
+The seed is set once at the top for reproducibility. The `design_factors` list defines the six factors from @sec-design. The total number of Monte Carlo replications (4,012) is split into 34 batches of `4012 / 34 = 118` iterations each. Batching serves two purposes: it enables parallel distribution across CPU cores, and it provides natural checkpoints for monitoring progress.
+
+### Block 3 --- Filter and assign seeds
+
+```{r}
+#| label: block3-filter-seeds
+#| eval: false
+params <- expand.grid(c(design_factors, list(batch = 1:batches)))
+params <- subset(params, struct == "CS" | omega == 0.00)
+
+params$iterations <- total_reps / batches
+params$seed <- round(runif(1) * 2^30) + 1:nrow(params)
+```
+
+The `expand.grid()` call crosses all factors (including batch) into a full factorial grid. The `subset()` line removes the redundant HCS + non-zero omega conditions, exactly as described in @sec-filtering. Each row then receives a unique seed derived from the master RNG stream, ensuring reproducibility even when rows are dispatched to different workers in unpredictable order.
+
+### Block 4 --- Parallel execution and storage
+
+```{r}
+#| label: block4-parallel-execution
+#| eval: false
+library(Pusto)
+cluster <- start_parallel(source_obj = source_obj, setup = "register")
+
+tm <- system.time(
+  results <- plyr::mdply(
+    params,
+    .f = purrr::possibly(simulate_meta, otherwise = data.frame()),
+    covariates = covariates, studyID = studyID,
+    subgroup = subgroup, sample_sizes = sample_sizes,
+    beta = beta,
+    tau_covariate = tau_covariate, tau_corr = tau_corr,
+    tau_scalar = tau_scalar,
+    min_studies = 4, max_effects = 12,
+    mods = c("robu", "CHE", "SCE"),
+    r_imputed = 0.6,
+    .parallel = TRUE
+  )
+)
+
+save(tm, params, results, session_info, run_date,
+     file = "RVE-simulation-dvcat-results.Rdata")
+```
+
+Several details are worth highlighting:
+
+- **`plyr::mdply()`** applies a function row-wise over a data frame of parameters, returning a combined data frame. With `.parallel = TRUE`, it dispatches rows to the registered parallel backend.
+- **`purrr::possibly()`** wraps `simulate_meta()` so that if any single iteration errors (e.g., a non-convergent model), it returns an empty data frame instead of crashing the entire run.
+- **`mods = c("robu", "CHE", "SCE")`** tells the pipeline to fit all three working models --- robust variance estimation via `robumeta`, correlated-and-hierarchical effects via `metafor::rma.mv`, and subgroup correlated effects via `metafor::rma.mv` with a block-diagonal structure.
+- **`system.time()`** records wall-clock and CPU time for the full run.
+- The final `save()` bundles results, parameters, timing, and session information into a single `.Rdata` file for downstream analysis.
+
+
+## Parallel processing {#sec-parallel}
+
+Each row of the parameter grid is independent --- a single call to `simulate_meta()` with a unique seed. This makes the simulation embarrassingly parallel: we can distribute rows across CPU cores with no communication between workers.
+
+::: {.panel-tabset}
+
+#### simhelpers / furrr
+
+The modern approach uses the `future` framework with `furrr::future_pmap()`. The `simhelpers` package provides `evaluate_by_row()`, which wraps this pattern with built-in seed management:
+
+```{r}
+#| label: parallel-simhelpers
+#| eval: false
+library(future)
+library(furrr)
+library(simhelpers)
+
+plan(multisession, workers = parallel::detectCores() - 1)
+
+results <- evaluate_by_row(
+  params,
+  .f = simulate_meta,
+  covariates = covariates,
+  studyID = studyID,
+  subgroup = subgroup,
+  sample_sizes = sample_sizes,
+  beta = beta,
+  tau_covariate = tau_covariate,
+  tau_corr = tau_corr,
+  tau_scalar = tau_scalar,
+  min_studies = 4,
+  max_effects = 12,
+  mods = c("robu", "CHE", "SCE"),
+  r_imputed = 0.6
+)
+
+plan(sequential)  # clean up
+```
+
+The `future` backend handles exporting objects to workers automatically, and `evaluate_by_row()` manages per-row seeding via `future.seed`.
+
+#### Original P&T
+
+The original code uses the `Pusto` package (a personal utility library by the first author) to set up a PSOCK cluster and register it with `plyr`:
+
+```{r}
+#| label: parallel-original
+#| eval: false
+library(Pusto)
+cluster <- start_parallel(source_obj = source_obj, setup = "register")
+
+results <- plyr::mdply(
+  params,
+  .f = purrr::possibly(simulate_meta, otherwise = data.frame()),
+  covariates = covariates, studyID = studyID,
+  subgroup = subgroup, sample_sizes = sample_sizes,
+  beta = beta,
+  tau_covariate = tau_covariate, tau_corr = tau_corr,
+  tau_scalar = tau_scalar,
+  min_studies = 4, max_effects = 12,
+  mods = c("robu", "CHE", "SCE"),
+  r_imputed = 0.6,
+  .parallel = TRUE
+)
+
+parallel::stopCluster(cluster)
+```
+
+The `start_parallel()` function creates a cluster, exports all objects named in `source_obj`, loads required packages on each worker, and registers the cluster with `plyr` via `doParallel`. The `.parallel = TRUE` flag in `mdply()` then dispatches rows across the cluster.
+
+:::
+
+
+## Seed management {#sec-seeds}
+
+Reproducibility in parallel simulations requires careful seed management. When iterations run on different workers in non-deterministic order, relying on a single global seed is insufficient.
+
+@pustejovsky2022 handle this by assigning each row of `params` its own unique seed:
+
+```{r}
+#| label: seed-assignment
+#| eval: false
+params$seed <- round(runif(1) * 2^30) + 1:nrow(params)
+```
+
+The `runif(1)` call draws from the master RNG stream (seeded by `set.seed(20210128)`), and the sequential offset `1:nrow(params)` ensures every row gets a distinct value. Inside `simulate_meta()`, each iteration calls `set.seed()` with its assigned seed before generating data, so results are identical regardless of how rows are distributed across workers or how many cores are available.
+
+This is a simple and effective strategy. The `future` framework offers a more formal approach via L'Ecuyer-CMRG parallel RNG streams (`future.seed = TRUE`), but the per-row seed approach used here achieves the same practical goal. Modern parallelization via `furrr` or `future` uses L'Ecuyer-CMRG streams by default (`furrr_options(seed = TRUE)`), which ensures reproducibility across multiple cores without the manual per-batch seed assignment used here.
+
+
+## Timing and computational budget {#sec-timing}
+
+The full simulation is computationally intensive. Each call to `simulate_meta()` generates a synthetic dataset, fits three multivariate meta-regression models (including iterative REML estimation), and extracts coefficient tables. Across 4,012 replications and 72 unique conditions (per specification), this amounts to:
+
+$$
+72 \times 34 \text{ batches} \times 118 \text{ iterations/batch} \times 3 \text{ models} \approx 867{,}000 \text{ model fits}
+$$
+
+per specification, and roughly 1.7 million model fits total across both dvcat and Ctype.
+
+On a modern multi-core workstation, each specification takes several hours. The exact wall-clock time depends on the number of cores, clock speed, and RAM. The `tm` object saved in the results file records the actual elapsed time from the original run.
+
+
+## Partial execution for the course {#sec-partial}
+
+**You do not need to run the full simulation to learn from this course.** The full 4,012 replications exist to achieve the Monte Carlo precision reported in the paper. For learning purposes, much smaller runs are sufficient:
+
+- **Debugging (10 reps):** Use 10 replications to verify that the pipeline runs without errors and produces output in the expected format. This takes seconds.
+- **Learning (100 reps):** Use 100 replications to see meaningful patterns in the performance metrics, even if the estimates are noisy. This takes a few minutes.
+
+To run a reduced version, simply modify the batching parameters:
+
+```{r}
+#| label: partial-execution
+#| eval: false
+batches <- 1
+total_reps <- 10    # or 100 for a more informative run
+
+params <- expand.grid(c(design_factors, list(batch = 1:batches)))
+params <- subset(params, struct == "CS" | omega == 0.00)
+params$iterations <- total_reps / batches
+params$seed <- round(runif(1) * 2^30) + 1:nrow(params)
+```
+
+For the analysis chapters that follow (@sec-metrics through @sec-reporting), we will use the pre-computed results from the full simulation. This lets everyone work with the same high-precision estimates regardless of local computing resources.
+
+
+## Loading pre-computed results {#sec-load-results}
+
+The repository includes both sets of pre-computed results in the `data/` directory. Let us load the dvcat results and examine their structure.
+
+::: {.callout-note}
+If the data files are missing, run `source("R/download-data.R")` to check which files are needed and where to obtain them.
+:::
+
+```{r}
+#| label: load-dvcat
+load("data/RVE-simulation-dvcat-results.Rdata")
+```
+
+The `load()` call restores four objects into the environment: `results`, `params`, `tm`, and `session_info`. The timing object tells us how long the original run took:
+
+```{r}
+#| label: timing-dvcat
+tm
+```
+
+The `params` data frame records the full parameter grid that was executed:
+
+```{r}
+#| label: params-dvcat
+dim(params)
+names(params)
+```
+
+The main `results` data frame contains all simulation output. Let us inspect its dimensions and columns:
+
+```{r}
+#| label: results-dvcat-dims
+dim(results)
+names(results)
+```
+
+Each row in `results` corresponds to one model coefficient from one replication under one parameter condition. The design-factor columns (inherited from `params` via `mdply()`) are followed by estimation output columns (estimates, standard errors, confidence interval bounds, degrees of freedom, etc.).
+
+We can similarly load the Ctype results:
+
+```{r}
+#| label: load-ctype
+load("data/RVE-simulation-Ctype-results.Rdata")
+dim(results)
+```
+
+
+## Quick sanity checks {#sec-sanity}
+
+Before moving to formal performance evaluation, a few quick checks confirm that the results are well-formed.
+
+How many unique parameter conditions were executed?
+
+```{r}
+#| label: sanity-conditions
+load("data/RVE-simulation-dvcat-results.Rdata")
+
+results |>
+  distinct(n_studies, struct, tau, omega, rho) |>
+  nrow()
+```
+
+How many estimation methods appear in the output?
+
+```{r}
+#| label: sanity-models
+results |>
+  distinct(mod) |>
+  pull(mod)
+```
+
+A glimpse at the first few rows:
+
+```{r}
+#| label: sanity-head
+results |>
+  select(1:10) |>
+  head(8)
+```
+
+If these checks show 72 unique conditions (for dvcat), three estimation methods, and a results table with tens of thousands of rows, the data are ready for the performance analysis in the next chapter.
+
+
+## Summary
+
+This chapter covered the mechanics of running the @pustejovsky2022 simulation:
+
+- The two driver scripts (`RVE-simulation-dvcat.R` and `RVE-simulation-Ctype.R`) follow identical logic, differing only in the empirical data objects they load.
+- Execution relies on row-wise application of `simulate_meta()` across the parameter grid, with `.parallel = TRUE` distributing work across CPU cores.
+- Per-row seeds ensure reproducibility regardless of parallelization details.
+- The full simulation involves roughly 1.7 million model fits and takes hours on a multi-core machine.
+- For this course, we use pre-computed `.Rdata` results so that everyone can proceed to the analysis chapters without waiting for a lengthy computation.
+
+In the next chapter, we turn to the **P** in ADEMP: computing performance metrics from the simulation output and assessing how well each working model performs across the design conditions.
+
+
+## Exercises {.unnumbered}
+
+::: {.callout-caution title="Exercise 10.1: Design your own extension"}
+Suppose you wanted to add a new factor to the simulation: the assumed working correlation used in estimation (currently fixed at $\rho = 0.6$). Add levels $\rho_{\text{assumed}} = 0.4$ and $\rho_{\text{assumed}} = 0.8$ to the design grid. How many total conditions would this create? How many additional replications would be needed?
+
+::: {.callout-tip title="Hint" collapse="true"}
+Multiply the current 72 conditions by the 3 levels of $\rho_{\text{assumed}}$. The computational cost scales linearly with the number of conditions.
+:::
+:::

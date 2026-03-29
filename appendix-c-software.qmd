@@ -1,0 +1,125 @@
+# Software Comparison Reference {#sec-appendix-software .appendix}
+
+```{r}
+#| label: setup-software
+#| include: false
+source("_common.R")
+```
+
+This appendix provides a comprehensive reference for the two R packages used throughout this book: **simhelpers** [@simhelpers] for simulation design and execution, and **rsimsum** [@gasparini2018] for post-hoc performance analysis and visualization. Together they cover the full Monte Carlo simulation lifecycle.
+
+## Function mapping {#sec-function-mapping}
+
+@tbl-function-map shows how simulation tasks map to functions in each package. The key insight is that simhelpers covers the *upstream* workflow (bundling, iteration, multi-scenario execution) while rsimsum excels at *downstream* analysis and visualization.
+
+| Task | simhelpers | rsimsum | Notes |
+|:-----|:-----------|:--------|:------|
+| Bundle DGP + method | `bundle_sim()` | --- | Wraps generate and analyze into a single callable |
+| Iterate replications | `repeat_and_stack()` | --- | Runs bundled function $R$ times, row-binds results |
+| Multi-scenario execution | `evaluate_by_row()` | --- | Applies simulation across a parameter grid |
+| Bias and RMSE | `calc_absolute()` | `simsum()` + `tidy()` | simhelpers returns MCSEs by default |
+| Coverage & width | `calc_coverage()` | `simsum()` + `tidy()` | Both support nominal level argument; `calc_coverage()` also returns interval width |
+| Rejection rate | `calc_rejection()` | `simsum()` + `tidy()` | Type I error or power, depending on $\theta$ |
+| Relative performance | `calc_relative()` | `simsum()` | Relative bias, relative MSE |
+| Relative variance metrics | `calc_relative_var()` | `simsum()` | Relative efficiency via variance ratios |
+| Visualization | ggplot2 (manual) | `autoplot()` | rsimsum provides fast diagnostic plots that return editable ggplot objects |
+| Missing data diagnostics | --- | `simsum(..., dropbig)` | rsimsum flags extreme estimates that may distort summaries |
+
+: Function mapping between simhelpers and rsimsum. {#tbl-function-map}
+
+## Notation mapping {#sec-notation-mapping}
+
+Notation varies across the simulation methodology literature. @tbl-notation-map provides a concordance for the key quantities discussed in this book, linking the foundational references [@white2010; @morris2019] to the DSR framework and both software packages.
+
+| Concept | @white2010 | @morris2019 | DSR / SMC | simhelpers | rsimsum |
+|:--------|:-----------|:------------|:----------|:-----------|:--------|
+| True parameter | $\beta$ | $\theta$ | $\theta$ | `true_param` | `true` |
+| Point estimate | $\hat\beta$ | $\hat\theta$ | $\hat{\theta}$ | `estimates` | `estvarname` |
+| SE estimate | $\widehat{\text{SE}}$ | $\widehat{\text{SE}}$ | $\hat{V}^{1/2}$ | `se` | `se` |
+| Number of reps | $n_{\text{sim}}$ | $n_{\text{sim}}$ | $R$ | `reps` (in `evaluate_by_row`) | `nsim` (computed) |
+| Bias | $\text{Bias}$ | $\text{Bias}$ | $\text{Bias}$ | `calc_absolute(criteria = "bias")` | `stat = "bias"` |
+| Emp. SE | $\text{EmpSE}$ | $\text{EmpSE}$ | $\sqrt{T_\theta}$ | `calc_absolute(criteria = "stddev")` | `stat = "empse"` |
+| Coverage | $\text{Cover}$ | $\text{Coverage}$ | $C_\alpha$ | `calc_coverage()` | `stat = "cover"` |
+| MCSE | --- | $\text{MCSE}$ | $\text{MCSE}$ | returned automatically | `stat = "..._mcse"` |
+
+: Notation concordance across simulation methodology references and software. {#tbl-notation-map}
+
+## When to use which package {#sec-when-to-use}
+
+### simhelpers: full lifecycle management
+
+Use simhelpers when you need to *design and execute* a simulation study from scratch. It provides the scaffolding for the Develop--Execute phases of the DSR framework:
+
+- **Bundling** (`bundle_sim()`) enforces clean separation between data generation and analysis.
+- **Iteration** (`repeat_and_stack()`) handles replication with built-in seed management.
+- **Execution** (`evaluate_by_row()`) maps the bundled simulation across a parameter grid, optionally in parallel.
+- **Summarization** (`calc_absolute()`, `calc_coverage()`, `calc_rejection()`) computes performance criteria with Monte Carlo standard errors included by default --- a feature absent from @pustejovsky2022's original code.
+
+### rsimsum: post-hoc analysis and visualization
+
+Use rsimsum when you already have a data frame of simulation results and need to *analyze and visualize* them. Its strengths lie in the Analyze phase:
+
+- `simsum()` computes a comprehensive suite of performance measures in one call, organized by method and scenario.
+- `autoplot()` produces fast diagnostic plots that return editable ggplot objects, including nested-loop plots and lolly plots.
+- Built-in diagnostics flag extreme estimates that may distort summaries via the `dropbig` argument.
+- The `tidy()` method returns results in a long-format tibble ready for further manipulation.
+
+### Best together
+
+The two packages are complementary rather than competing. The recommended workflow uses simhelpers *upstream* (design, generate, execute) and rsimsum *downstream* (summarize, visualize, report):
+
+> simhelpers owns the simulation; rsimsum owns the analysis.
+
+This division mirrors the DSR framework itself: Develop and Execute with simhelpers, Analyze with rsimsum.
+
+## The complementary workflow {#sec-complementary-workflow}
+
+The code template below illustrates the handoff between simhelpers (execution) and rsimsum (analysis). This is the pattern used throughout the main chapters of this book.
+
+```{r}
+#| eval: false
+#| label: complementary-workflow
+
+library(simhelpers)
+library(rsimsum)
+
+# --- Phase 1: Design (simhelpers) ---
+params <- tidyr::expand_grid(
+  n     = c(20, 50, 100),
+  beta  = c(0, 0.5),
+  sigma = c(1, 2)
+)
+
+# --- Phase 2: Develop (simhelpers) ---
+sim_driver <- bundle_sim(
+  f_generate = my_dgp,
+  f_analyze  = my_method
+)
+
+# --- Phase 3: Execute (simhelpers) ---
+raw_results <- evaluate_by_row(
+  params,
+  sim_driver,
+  reps = 2000
+)
+
+# --- Phase 4: Analyze (rsimsum) ---
+# Reshape for rsimsum: one row per replicate per scenario
+s <- simsum(
+  data      = raw_results,
+  estvarname = "estimate",
+  se         = "std_error",
+  true       = "beta",
+  by         = c("n", "sigma"),
+  methodvar  = "method"
+)
+
+# Quick summary table
+tidy(s) |>
+  dplyr::filter(stat %in% c("bias", "cover", "empse"))
+
+# Fast diagnostic visualization (returns editable ggplot objects)
+autoplot(s, type = "nlp")
+```
+
+The handoff point is the `raw_results` data frame: simhelpers produces it, rsimsum consumes it. No reformatting is needed beyond ensuring the column names match rsimsum's argument expectations.

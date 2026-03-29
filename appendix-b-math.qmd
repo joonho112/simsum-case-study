@@ -1,0 +1,188 @@
+# Mathematical Details {#sec-appendix-math .appendix}
+
+```{r}
+#| label: setup-math
+#| include: false
+source("_common.R")
+```
+
+This appendix collects the mathematical derivations underlying the working models discussed in @sec-models. All results follow from the supplementary materials of @pustejovsky2022; we reproduce them here for self-contained reference. Notation matches @tbl-notation in @sec-models throughout. As in @sec-models, $\bar{s}_j^2$ denotes the study-level average sampling variance, corresponding to the supplement's notation where the constant sampling correlation structure uses averaged rather than individual variances.
+
+
+## WLS estimation and robust variance {#sec-math-wls}
+
+Let $\mathbf{T}_j$ denote the $n_j \times 1$ vector of effect size estimates, $\mathbf{X}_j$ the $n_j \times p$ design matrix, $\mathbf{u}_j$ the vector of random effects, and $\mathbf{e}_j$ the vector of sampling errors for study $j = 1, \ldots, J$. The general meta-regression model is
+
+$$
+\mathbf{T}_j = \mathbf{X}_j\boldsymbol{\beta} + \mathbf{u}_j + \mathbf{e}_j.
+$$
+
+Given weight matrices $\mathbf{W}_1, \ldots, \mathbf{W}_J$, the WLS estimator of $\boldsymbol{\beta}$ is
+
+$$
+\hat{\boldsymbol{\beta}} = \mathbf{M}\left(\sum_{j=1}^{J} \mathbf{X}_j'\mathbf{W}_j\mathbf{T}_j\right), \qquad \mathbf{M} = \left(\sum_{j=1}^{J} \mathbf{X}_j'\mathbf{W}_j\mathbf{X}_j\right)^{-1}.
+$$ {#eq-app-wls}
+
+The true sampling variance of $\hat{\boldsymbol{\beta}}$ is
+
+$$
+\text{Var}(\hat{\boldsymbol{\beta}}) = \mathbf{M}\left(\sum_{j=1}^{J} \mathbf{X}_j'\mathbf{W}_j\boldsymbol{\Phi}_j\mathbf{W}_j\mathbf{X}_j\right)\mathbf{M},
+$$ {#eq-app-true-var}
+
+where $\boldsymbol{\Phi}_j = \text{Var}(\mathbf{u}_j + \mathbf{e}_j)$. When $\mathbf{W}_j = \boldsymbol{\Phi}_j^{-1}$, @eq-app-true-var simplifies to $\text{Var}(\hat{\boldsymbol{\beta}}) = \mathbf{M}$.
+
+In practice, $\boldsymbol{\Phi}_j$ is unknown. The RVE approach estimates the sampling variance empirically. Let $\hat{\mathbf{e}}_j = \mathbf{T}_j - \mathbf{X}_j\hat{\boldsymbol{\beta}}$ be the residual vector for study $j$. The robust variance estimator is
+
+$$
+\widehat{\text{Var}}(\hat{\boldsymbol{\beta}}) = \mathbf{M}\left(\sum_{j=1}^{J} \mathbf{X}_j'\mathbf{W}_j\mathbf{A}_j\hat{\mathbf{e}}_j\hat{\mathbf{e}}_j'\mathbf{A}_j\mathbf{W}_j\mathbf{X}_j\right)\mathbf{M},
+$$ {#eq-app-rve}
+
+where $\mathbf{A}_j$ are small-sample adjustment matrices [@tiptonpustejovsky2015]. This estimator is approximately unbiased for $\text{Var}(\hat{\boldsymbol{\beta}})$ regardless of whether the weight matrices match the true $\boldsymbol{\Phi}_j$, which is the central property that makes RVE robust to working-model misspecification.
+
+
+## Variance-covariance matrices for all working models {#sec-math-vcov}
+
+Throughout this section, $\mathbf{I}_j$ denotes the $n_j \times n_j$ identity matrix and $\mathbf{J}_j$ denotes the $n_j \times n_j$ matrix of ones. For models that use the constant sampling correlation assumption, $\bar{s}_j^2$ denotes the average sampling variance in study $j$.
+
+### Hierarchical effects (HE) {#sec-math-he}
+
+The HE model [@hedges2010] assumes independent sampling errors and two levels of random effects. The marginal variance-covariance matrix is
+
+$$
+\boldsymbol{\Phi}_j^{HE} = \tau^2\mathbf{J}_j + \tilde{\mathbf{S}}_j,
+$$ {#eq-app-phi-he}
+
+where $\tilde{\mathbf{S}}_j = \text{diag}(\omega^2 + s_{1j}^2, \ldots, \omega^2 + s_{n_jj}^2)$.
+
+**Inverse.** Using the Sherman--Morrison formula,
+
+$$
+\left(\boldsymbol{\Phi}_j^{HE}\right)^{-1} = \tilde{\mathbf{S}}_j^{-1} - x_j\,\tilde{\mathbf{S}}_j^{-1}\mathbf{J}_j\tilde{\mathbf{S}}_j^{-1},
+$$ {#eq-app-phi-he-inv}
+
+where
+
+$$
+x_j = \left(\frac{1}{\tau^2} + \sum_{i=1}^{n_j}\frac{1}{\omega^2 + s_{ij}^2}\right)^{-1}.
+$$
+
+**Approximately efficient weights.** The original HE weights are diagonal:
+
+$$
+\mathbf{W}_j^{HE} = \text{diag}\!\left(\frac{1}{\hat{\tau}^2 + \hat{\omega}^2 + s_{1j}^2},\;\ldots,\;\frac{1}{\hat{\tau}^2 + \hat{\omega}^2 + s_{n_jj}^2}\right),
+$$ {#eq-app-w-he}
+
+where $\hat{\tau}^2$ and $\hat{\omega}^2$ are method-of-moments estimators. These weights ignore the off-diagonal structure in @eq-app-phi-he-inv, treating effect sizes as if they were independent.
+
+
+### Correlated effects (CE) {#sec-math-ce}
+
+The CE model [@hedges2010] assumes correlated sampling errors and a single between-study random effect. The marginal variance-covariance matrix is
+
+$$
+\boldsymbol{\Phi}_j^{CE} = \left(\tau^2 + \rho\,\bar{s}_j^2\right)\mathbf{J}_j + (1 - \rho)\,\bar{s}_j^2\,\mathbf{I}_j.
+$$ {#eq-app-phi-ce}
+
+**Inverse.**
+
+$$
+\left(\boldsymbol{\Phi}_j^{CE}\right)^{-1} = \frac{1}{(1-\rho)\,\bar{s}_j^2}\left[\mathbf{I}_j - q_j\,\mathbf{J}_j\right],
+$$ {#eq-app-phi-ce-inv}
+
+where
+
+$$
+q_j = \frac{\tau^2 + \rho\,\bar{s}_j^2}{\left(\tau^2 + \rho\,\bar{s}_j^2\right)n_j + (1-\rho)\,\bar{s}_j^2}.
+$$
+
+**Approximately efficient weights.** Every effect size in study $j$ receives the same weight:
+
+$$
+\mathbf{W}_j^{CE} = \frac{1}{n_j\left(\hat{\tau}^2 + \bar{s}_j^2\right)}\,\mathbf{I}_j,
+$$ {#eq-app-w-ce}
+
+where $\hat{\tau}^2$ is a method-of-moments estimator. These are again diagonal matrices, differing from the fully inverse-variance weights in @eq-app-phi-ce-inv.
+
+
+### Correlated-and-hierarchical effects (CHE) {#sec-math-che}
+
+The CHE model [@pustejovsky2022] combines correlated sampling errors with two levels of random effects. The marginal variance-covariance matrix is
+
+$$
+\boldsymbol{\Phi}_j^{CHE} = \left[\tau^2 + \rho\,\bar{s}_j^2\right]\mathbf{J}_j + \left[\omega^2 + (1-\rho)\,\bar{s}_j^2\right]\mathbf{I}_j.
+$$ {#eq-app-phi-che}
+
+Setting $\omega^2 = 0$ recovers $\boldsymbol{\Phi}_j^{CE}$; setting $\rho = 0$ and using individual $s_{ij}^2$ in place of $\bar{s}_j^2$ recovers $\boldsymbol{\Phi}_j^{HE}$.
+
+**Inverse.**
+
+$$
+\left(\boldsymbol{\Phi}_j^{CHE}\right)^{-1} = \frac{1}{\omega^2 + (1-\rho)\,\bar{s}_j^2}\left[\mathbf{I}_j - \tilde{q}_j\,\mathbf{J}_j\right],
+$$ {#eq-app-phi-che-inv}
+
+where
+
+$$
+\tilde{q}_j = \frac{\tau^2 + \rho\,\bar{s}_j^2}{\left(\tau^2 + \rho\,\bar{s}_j^2\right)n_j + \omega^2 + (1-\rho)\,\bar{s}_j^2}.
+$$
+
+**Fully inverse-variance weights.** Unlike HE and CE, @pustejovsky2022 propose using the full matrix inverse as the weight:
+
+$$
+\mathbf{W}_j^{CHE} = \left(\hat{\boldsymbol{\Phi}}_j^{CHE}\right)^{-1},
+$$ {#eq-app-w-che}
+
+where $\hat{\boldsymbol{\Phi}}_j^{CHE}$ substitutes REML estimates of $\tau^2$ and $\omega^2$ into @eq-app-phi-che. These non-diagonal weights account for within-study correlation and can yield substantial efficiency gains over the diagonal weights of HE and CE.
+
+
+### Subgroup correlated effects (SCE) {#sec-math-sce}
+
+The SCE model [@pustejovsky2022] allows category-specific between-study heterogeneity across $C$ subgroups. Let $\mathbf{D}_j$ be the $n_j \times C$ matrix of category indicators (row $i$, column $c$ equals $d_{ij}^c$), $n_j^c = \sum_{i=1}^{n_j}d_{ij}^c$, and $\boldsymbol{\Theta}_{ID} = \text{diag}(\tau_1^2, \ldots, \tau_C^2)$. The marginal variance-covariance matrix is
+
+$$
+\boldsymbol{\Phi}_j^{SCE} = \mathbf{D}_j\left[\boldsymbol{\Theta}_{ID} + \rho\,\bar{s}_j^2\,\mathbf{I}_C\right]\mathbf{D}_j' + (1-\rho)\,\bar{s}_j^2\,\mathbf{I}_j.
+$$ {#eq-app-phi-sce}
+
+**Inverse.**
+
+$$
+\left(\boldsymbol{\Phi}_j^{SCE}\right)^{-1} = \frac{1}{(1-\rho)\,\bar{s}_j^2}\left[\mathbf{I}_j - \mathbf{D}_j\,\mathbf{Q}_j\,\mathbf{D}_j'\right],
+$$ {#eq-app-phi-sce-inv}
+
+where $\mathbf{Q}_j = \text{diag}(q_1, \ldots, q_C)$ with
+
+$$
+q_c = \frac{\tau_c^2 + \rho\,\bar{s}_j^2}{\left(\tau_c^2 + \rho\,\bar{s}_j^2\right)n_j^c + (1-\rho)\,\bar{s}_j^2}.
+$$
+
+**Fully inverse-variance weights.** As with CHE, the SCE model uses $\mathbf{W}_j^{SCE} = \left(\hat{\boldsymbol{\Phi}}_j^{SCE}\right)^{-1}$, with REML estimates of $\tau_1^2, \ldots, \tau_C^2$ substituted into @eq-app-phi-sce. The weight matrices have non-zero off-diagonal entries only for pairs of effect sizes within the same category. Pairs from different categories receive zero weight, making SCE equivalent to applying CE with fully inverse-variance weights separately within each subgroup.
+
+
+## Further extensions {#sec-math-extensions}
+
+### CHE+ model with lab-level grouping {#sec-math-che-plus}
+
+Working models can be elaborated by adding levels of random effects. As an example, @pustejovsky2022 describe a CHE+ model that captures dependence within groups of studies generated by the same laboratory. Let $T_{ijk}$ denote effect size estimate $i$ from study $j$ within lab group $k$, for $i = 1, \ldots, n_{jk}$, $j = 1, \ldots, J_k$, $k = 1, \ldots, K$. The CHE+ model is
+
+$$
+T_{ijk} = \mathbf{x}_{ijk}\boldsymbol{\beta} + t_k + u_{jk} + v_{ijk} + e_{ijk},
+$$ {#eq-app-che-plus}
+
+where
+
+$$
+\text{Var}(t_k) = \tau_{\text{group}}^2, \quad \text{Var}(u_{jk}) = \tau_{\text{study}}^2, \quad \text{Var}(v_{ijk}) = \omega^2, \quad \text{Var}(e_{ijk}) = s_{jk}^2,
+$$
+
+and $\text{Cov}(e_{hjk}, e_{ijk}) = \rho\,\bar{s}_{jk}^2$ for $h \neq i$. This model adds a group-level random effect $t_k$ and an additional variance component $\tau_{\text{group}}^2$ beyond the standard CHE specification. The same principle---adding random-effect terms at meaningful clustering levels---can be applied whenever the meta-analytic data have a nested structure that extends beyond study and effect size.
+
+
+### Sampling auto-correlation assumption {#sec-math-autocorr}
+
+The constant sampling correlation assumption posits that all pairs of sampling errors within a study share the same correlation $\rho$. When effect sizes correspond to repeated measures at different time points, a first-order auto-regressive structure may be more realistic. Let $f_{ij}$ denote the time point for effect size $i$ in study $j$. The sampling auto-correlation assumption replaces the constant $\rho$ with
+
+$$
+\text{Cov}(e_{hj}, e_{ij}) = \psi^{|f_{hj} - f_{ij}|}\,s_{hj}\,s_{ij},
+$$ {#eq-app-autocorr}
+
+where $\psi$ is a specified auto-correlation parameter common across studies. When primary studies report information about the degree of auto-correlation, the meta-analyst can use it to inform the choice of $\psi$; otherwise, a plausible value can be chosen and sensitivity analysis conducted across a range of values, following the same logic as sensitivity analysis over $\rho$ in the constant correlation case.

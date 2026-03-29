@@ -1,0 +1,420 @@
+# Performance Metrics with simhelpers and rsimsum {#sec-metrics}
+
+```{r}
+#| label: setup-metrics
+#| include: false
+source("_common.R")
+```
+
+```{r}
+#| label: load-utils
+#| include: false
+source("R/utils-results.R")
+```
+
+The simulation has produced thousands of rows of output. This chapter turns that output into the performance metrics that answer the study's research questions. We examine two complementary approaches: the `simhelpers` package [@simhelpers], which computes metrics with Monte Carlo standard errors (MCSEs) from iteration-level data, and the pre-computed summary statistics that @pustejovsky2022 store directly in their results files. We also discuss `rsimsum` [@gasparini2018], which provides similar functionality with a different interface.
+
+The key constraint for our replication is that the pre-computed `.Rdata` files contain **batch-level** performance metrics --- not the individual-iteration estimates from which those summaries were computed. Each row in the results data frame represents a **single batch** of approximately 118 replications. There are 34 such batches per condition, and we must aggregate them before computing final performance metrics. This means we cannot recompute metrics from raw iterations using `simhelpers` or `rsimsum`. We can, however, approximate Monte Carlo standard errors from the available summary statistics and compute all the relative-efficiency comparisons reported in the paper.
+
+
+## Loading the pre-computed results {#sec-load-results}
+
+We begin by loading the dvcat and Ctype simulation results.
+
+```{r}
+#| label: load-results
+load("data/RVE-simulation-dvcat-results.Rdata")
+dvcat_results <- results
+
+load("data/RVE-simulation-Ctype-results.Rdata")
+ctype_results <- results
+
+rm(results)
+```
+
+Each results data frame contains one row per **batch** per unique combination of parameter condition, estimation method, and coefficient. There are 34 batches per condition (each containing approximately 118 replications), so these batch-level summaries must be aggregated before we can draw conclusions about overall performance.
+
+```{r}
+#| label: results-dims
+cat("dvcat:", nrow(dvcat_results), "rows x", ncol(dvcat_results), "columns\n")
+cat("Ctype:", nrow(ctype_results), "rows x", ncol(ctype_results), "columns\n")
+```
+
+
+## Understanding the output structure {#sec-structure}
+
+Both results files share the same 17 columns. The first seven identify the simulation condition:
+
+| Column | Description |
+|--------|-------------|
+| `n_studies` | Number of studies (30 or 60) |
+| `struct` | Correlation structure (CS or HCS) |
+| `tau`, `omega` | Between-study and within-study heterogeneity |
+| `rho` | Mean of the Beta distribution used to generate study-specific correlations $\rho_j$ |
+| `nu` | Beta concentration parameter controlling the spread of study-specific correlations $\rho_j$ |
+| `seed` | Per-batch RNG seed for reproducibility |
+
+The next two columns identify what is being estimated:
+
+| Column | Description |
+|--------|-------------|
+| `mod` | Estimation method: `"robu"` (CE), `"CHE"`, or `"MV-DIAG"` (SCE) |
+| `coef` | Coefficient name (e.g., `"dv_catBAC"`) or variance component (`"tau2"`, `"omega2"`) |
+
+The remaining columns are the pre-computed performance metrics:
+
+| Column | Description |
+|--------|-------------|
+| `iterations` | Number of Monte Carlo replications (118 per batch) |
+| `convergence` | Proportion of replications where the model converged |
+| `bias` | Mean bias (estimate minus true value, averaged over replications) |
+| `rmse` | Root mean squared error |
+| `df_M` | Mean Satterthwaite degrees of freedom |
+| `df_SD` | Standard deviation of degrees of freedom across replications |
+| `cover` | Empirical coverage of 95% confidence intervals |
+| `width` | Mean confidence interval width |
+
+```{r}
+#| label: tbl-structure-glimpse
+#| tbl-cap: "Sample rows from the pre-computed simulation results for a single parameter condition."
+dvcat_results |>
+  filter(mod == "CHE", n_studies == 60, struct == "CS",
+         tau == 0.1, omega == 0, rho == 0.4) |>
+  select(coef, iterations, convergence, bias, rmse, cover, width) |>
+  head(8) |>
+  kable(digits = 4)
+```
+
+Notice that the `mod` column uses `"MV-DIAG"` to label what the paper calls the SCE (subgroup correlated effects) model. The three labels map to the estimation methods as follows: `"robu"` is the conventional robust variance estimation baseline (CE), `"CHE"` is the correlated-and-hierarchical effects model, and `"MV-DIAG"` is the subgroup correlated effects model (SCE).
+
+
+## P&T's assess_performance() approach {#sec-pt-approach}
+
+Inside `simulate_meta()`, @pustejovsky2022 compute performance metrics at the point of summarization rather than storing individual-iteration estimates. The function runs a single batch of replications for a given parameter condition, then returns a summary row per model and coefficient containing bias, RMSE, coverage, and interval width. Since each condition is split across 34 batches, these batch-level rows must be aggregated to obtain final performance metrics (see @sec-aggregate).
+
+This design choice has clear advantages: the results files are compact (roughly 100K rows rather than millions). The trade-off is that we lose access to iteration-level estimates, which means we cannot compute:
+
+- Monte Carlo standard errors (MCSEs) via the standard formulas
+- Distributional diagnostics (e.g., skewness of the estimator)
+- Alternative performance metrics not anticipated at design time
+
+As @morris2019 emphasize, reporting MCSEs alongside point estimates of performance metrics is essential for interpreting simulation results. Without them, we cannot distinguish genuine differences between methods from Monte Carlo noise.
+
+
+## What simhelpers would add {#sec-simhelpers-conceptual}
+
+::: {.panel-tabset}
+
+#### simhelpers (conceptual)
+
+If we had access to individual-iteration results --- one row per replication with columns for the estimate, standard error, and confidence interval bounds --- the `simhelpers` package [@simhelpers] would compute performance metrics with proper MCSEs. Here is what the workflow would look like.
+
+```{r}
+#| label: simhelpers-conceptual
+#| eval: false
+
+# Hypothetical iteration-level data: one row per replication
+# Columns: est (point estimate), se (standard error),
+#           ci_lo, ci_hi (confidence interval bounds),
+#           true_param (true parameter value)
+
+iteration_data |>
+  group_by(n_studies, struct, tau, omega, rho, mod, coef) |>
+  summarize(
+    # Absolute bias with MCSE
+    simhelpers::calc_absolute(
+      estimates = est,
+      true_param = first(true_param)
+    ),
+    # Coverage with MCSE
+    simhelpers::calc_coverage(
+      lower_bound = ci_lo,
+      upper_bound = ci_hi,
+      true_param = first(true_param)
+    ),
+    .groups = "drop"
+  )
+```
+
+The `calc_absolute()` function returns bias, variance, MSE, and RMSE along with their MCSEs. The `calc_coverage()` function returns empirical coverage with its MCSE. Both functions follow the MCSE formulas described in @morris2019.
+
+Similarly, `rsimsum` [@gasparini2018] provides the `simsum()` function that computes a comprehensive set of performance metrics from iteration-level data:
+
+```{r}
+#| label: rsimsum-conceptual
+#| eval: false
+
+# rsimsum expects a long-format data frame
+s <- rsimsum::simsum(
+  data = iteration_data,
+  estvarname = "est",
+  true = true_param_value,
+  se = "se",
+  methodvar = "mod",
+  by = c("n_studies", "struct", "tau", "omega", "rho")
+)
+
+summary(s)
+```
+
+Both packages would give us exactly the same point estimates as the pre-computed results, but with the addition of MCSEs that quantify simulation uncertainty.
+
+#### Pre-computed results
+
+Since our results already contain batch-level summarized metrics, we work with them directly. However, recall that each row represents a single batch of approximately 118 replications --- not the full condition-level summary. We must aggregate across the 34 batches per condition (see @sec-aggregate) before drawing final conclusions.
+
+```{r}
+#| label: tbl-precomputed-peek
+#| tbl-cap: "Performance metrics for three estimation methods under a single parameter condition (dvcat specification)."
+dvcat_results |>
+  filter(coef == "dv_catBAC", n_studies == 60, struct == "CS",
+         tau == 0.1, omega == 0, rho == 0.6) |>
+  select(mod, bias, rmse, cover, width, df_M) |>
+  kable(digits = 4)
+```
+
+The table above shows the three estimation methods side by side for a single focal coefficient under one parameter condition. Even without MCSEs, the relative patterns are clear: CHE achieves a smaller RMSE and narrower intervals than the CE baseline, while coverage remains near the nominal 95% level for all three methods.
+
+:::
+
+
+## Approximating MCSEs from summary statistics {#sec-mcse-approx}
+
+Although we lack iteration-level data, we can approximate MCSEs from the available summary statistics. The key relationships are:
+
+**MCSE for bias.** If the bias is computed as the sample mean of estimation errors, and the RMSE captures the standard deviation of those errors, then the empirical standard deviation of the estimator is $\text{SD} = \sqrt{\text{RMSE}^2 - \text{bias}^2}$. The MCSE of the mean bias is therefore:
+
+$$
+\text{MCSE}(\text{bias}) \approx \frac{\sqrt{\text{RMSE}^2 - \text{bias}^2}}{\sqrt{R}}
+$$
+
+where $R$ is the number of iterations.
+
+**MCSE for coverage.** Coverage is a sample proportion, so its MCSE follows the standard Bernoulli formula:
+
+$$
+\text{MCSE}(\text{coverage}) \approx \sqrt{\frac{\hat{C}(1 - \hat{C})}{R}}
+$$
+
+where $\hat{C}$ is the observed coverage rate.
+
+Let us add these approximate MCSEs to both results data frames.
+
+```{r}
+#| label: add-mcse
+
+add_mcse <- function(df) {
+  df |>
+    mutate(
+      # Aggregate iterations across batches within each condition
+      sd_est = sqrt(pmax(rmse^2 - bias^2, 0)),
+      mcse_bias = sd_est / sqrt(iterations),
+      mcse_cover = sqrt(cover * (1 - cover) / iterations)
+    )
+}
+
+dvcat_results <- add_mcse(dvcat_results)
+ctype_results <- add_mcse(ctype_results)
+```
+
+Note: these are approximate MCSEs because the `iterations` column reports the count per batch (118), not the total across all 34 batches (4,012). Each row in the results corresponds to a single batch, so the MCSEs are computed relative to the per-batch replication count. To get MCSEs for the overall average across batches, we would need to aggregate further.
+
+```{r}
+#| label: tbl-mcse-example
+#| tbl-cap: "Approximate MCSEs for bias and coverage across estimation methods."
+dvcat_results |>
+  filter(coef == "dv_catBAC", n_studies == 60,
+         struct == "CS", tau == 0.1, omega == 0, rho == 0.6) |>
+  select(mod, bias, mcse_bias, cover, mcse_cover) |>
+  kable(digits = 4)
+```
+
+
+## Aggregating across batches {#sec-aggregate}
+
+Since the results contain 34 batches per condition, we must aggregate to obtain a single set of metrics per unique condition, model, and coefficient. The `aggregate_batches()` function (defined in `R/utils-results.R`) computes weighted averages using the `iterations` count in each batch as the weight. For most metrics (bias, coverage, width), the weighted mean is the correct pooling operation. For RMSE, we take the weighted root-mean-square (averaging squared RMSEs, then taking the root). For `df_SD`, we apply the law of total variance to properly pool within-batch variance with between-batch variance of the means --- a simple weighted mean of per-batch SDs would understate the true variability.
+
+```{r}
+#| label: aggregate-batches
+
+dvcat_agg <- aggregate_batches(dvcat_results) |> add_labels()
+ctype_agg <- aggregate_batches(ctype_results) |> add_labels()
+
+cat("dvcat aggregated:", nrow(dvcat_agg), "rows\n")
+cat("Ctype aggregated:", nrow(ctype_agg), "rows\n")
+```
+
+Now each row represents a fully aggregated summary across all 4,012 replications, and the MCSEs reflect the full Monte Carlo sample size.
+
+
+## Relative RMSE: the primary comparison metric {#sec-relative-rmse}
+
+The central question in @pustejovsky2022 is whether CHE and SCE estimation improves efficiency relative to conventional robust variance estimation (CE). The primary metric for this comparison is the **relative RMSE** --- the ratio of each method's RMSE to the CE baseline. A ratio below 1 indicates an efficiency gain.
+
+We focus on the focal regression coefficients, excluding control variables (those ending in `_c` or `_long`) and variance components (`tau2`, `omega2`, and subgroup-specific `tau2_*` variants).
+
+```{r}
+#| label: focal-coefficients
+#| code-fold: true
+#| code-summary: "Focal coefficient filtering"
+
+# Identify focal coefficients for dvcat
+dvcat_focal <- dvcat_agg |>
+  filter(
+    !grepl("_c$|_long$", coef),
+    !grepl("^tau2|^omega2", coef)
+  )
+
+# Identify focal coefficients for Ctype
+ctype_focal <- ctype_agg |>
+  filter(
+    !grepl("_c$|_long$", coef),
+    !grepl("^tau2|^omega2", coef)
+  )
+
+cat("dvcat focal coefficients:", unique(dvcat_focal$coef), "\n")
+cat("Ctype focal coefficients:", unique(ctype_focal$coef), "\n")
+```
+
+Now we pivot wider by estimation method and compute RMSE ratios.
+
+```{r}
+#| label: rmse-ratios
+
+dvcat_ratios <- compute_ratios(dvcat_focal)
+ctype_ratios <- compute_ratios(ctype_focal)
+```
+
+A summary of the RMSE ratios across all conditions for the dvcat specification:
+
+```{r}
+#| label: tbl-dvcat-ratio-summary
+#| tbl-cap: "Summary of RMSE ratios (CHE and SCE relative to CE) across all dvcat conditions."
+dvcat_ratios |>
+  summarize(
+    across(c(ratio_CHE, ratio_SCE), list(
+      mean = mean,
+      median = median,
+      min = min,
+      max = max
+    ), .names = "{.col}_{.fn}")
+  ) |>
+  pivot_longer(everything(),
+               names_to = c("method", "stat"),
+               names_pattern = "ratio_(\\w+)_(\\w+)") |>
+  pivot_wider(names_from = stat, values_from = value) |>
+  kable(digits = 3, col.names = c("Method", "Mean", "Median", "Min", "Max"))
+```
+
+And for the Ctype specification:
+
+```{r}
+#| label: tbl-ctype-ratio-summary
+#| tbl-cap: "Summary of RMSE ratios (CHE and SCE relative to CE) across all Ctype conditions."
+ctype_ratios |>
+  summarize(
+    across(c(ratio_CHE, ratio_SCE), list(
+      mean = mean,
+      median = median,
+      min = min,
+      max = max
+    ), .names = "{.col}_{.fn}")
+  ) |>
+  pivot_longer(everything(),
+               names_to = c("method", "stat"),
+               names_pattern = "ratio_(\\w+)_(\\w+)") |>
+  pivot_wider(names_from = stat, values_from = value) |>
+  kable(digits = 3, col.names = c("Method", "Mean", "Median", "Min", "Max"))
+```
+
+We can also break down the RMSE ratios by key design factors:
+
+```{r}
+#| label: ratios-by-factor
+dvcat_ratios |>
+  group_by(n_studies) |>
+  summarize(
+    CHE_mean = mean(ratio_CHE),
+    SCE_mean = mean(ratio_SCE),
+    .groups = "drop"
+  ) |>
+  kable(digits = 3, caption = "Mean RMSE ratios by number of studies (dvcat)")
+```
+
+
+## Coverage diagnostics {#sec-coverage}
+
+Efficiency gains are only meaningful if coverage remains near the nominal level. We check empirical coverage rates across all conditions for the focal coefficients.
+
+```{r}
+#| label: coverage-check
+#| code-fold: true
+#| code-summary: "Coverage summary (dvcat)"
+
+dvcat_cover <- dvcat_agg |>
+  filter(
+    !grepl("_c$|_long$", coef),
+    !grepl("^tau2|^omega2", coef)
+  )
+
+dvcat_cover |>
+  group_by(mod) |>
+  summarize(
+    mean_cover = mean(cover),
+    min_cover = min(cover),
+    max_cover = max(cover),
+    pct_below_90 = mean(cover < 0.90),
+    .groups = "drop"
+  ) |>
+  kable(digits = 3, caption = "Coverage summary for focal coefficients (dvcat)")
+```
+
+```{r}
+#| label: coverage-ctype
+#| code-fold: true
+#| code-summary: "Coverage summary (Ctype)"
+ctype_cover <- ctype_agg |>
+  filter(
+    !grepl("_c$|_long$", coef),
+    !grepl("^tau2|^omega2", coef)
+  )
+
+ctype_cover |>
+  group_by(mod) |>
+  summarize(
+    mean_cover = mean(cover),
+    min_cover = min(cover),
+    max_cover = max(cover),
+    pct_below_90 = mean(cover < 0.90),
+    .groups = "drop"
+  ) |>
+  kable(digits = 3, caption = "Coverage summary for focal coefficients (Ctype)")
+```
+
+
+## Key findings at a glance {#sec-key-findings}
+
+The performance metrics computed above reveal several patterns consistent with the findings reported in @pustejovsky2022:
+
+1. **CHE achieves substantial efficiency gains for within-study predictors.** For the dvcat specification, where the focal predictor varies within studies, the CHE model's RMSE is consistently below the CE baseline (mean ratio well under 1). This confirms that modeling the correlated-and-hierarchical variance structure translates into meaningful precision gains for within-study contrasts.
+
+2. **Smaller gains for between-study predictors.** For the Ctype specification, where the focal predictor varies at the study level, the RMSE ratios are closer to 1. The CHE model still tends to outperform CE, but the margin is narrower because between-study contrasts benefit less from within-study variance modeling.
+
+3. **SCE offers consistent but modest improvements.** The subgroup correlated effects model (SCE/MV-DIAG) falls between CE and CHE in efficiency. It improves on the CE baseline but does not match the CHE model's gains, consistent with its intermediate variance structure.
+
+4. **Coverage remains near nominal for all methods.** Across both specifications and all parameter conditions, empirical coverage rates stay close to the target 95% level. This is critical: the efficiency gains from CHE and SCE do not come at the cost of degraded inference.
+
+5. **Larger samples amplify efficiency differences.** The RMSE ratios tend to be somewhat more favorable for CHE when the number of studies is larger (60 vs. 30), consistent with asymptotic theory suggesting that more complex variance models pay off with more data.
+
+These findings set the stage for the detailed visualizations in @sec-visualization, where we will display the RMSE ratios across all design factors to identify where the efficiency gains are largest and where the methods converge.
+
+
+## Summary
+
+This chapter computed the performance metrics needed to evaluate the three estimation methods in the @pustejovsky2022 simulation:
+
+- The pre-computed results contain batch-level summarized metrics (bias, RMSE, coverage, interval width) with 34 batches per condition, requiring aggregation across batches before final interpretation.
+- We demonstrated what `simhelpers` [@simhelpers] and `rsimsum` [@gasparini2018] would provide if iteration-level data were available, and noted the importance of MCSEs [@morris2019].
+- We approximated MCSEs from the available summary statistics and aggregated across batches to obtain full-sample metrics.
+- The relative RMSE --- the primary comparison metric --- confirms that CHE substantially outperforms CE for within-study predictors, with more modest gains for between-study predictors.
+- Coverage remains well-calibrated across all methods, ensuring that efficiency improvements do not compromise inferential validity.

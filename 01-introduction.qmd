@@ -1,0 +1,290 @@
+# Introduction: Learning by Replication {#sec-introduction}
+
+```{r}
+#| label: setup-introduction
+#| include: false
+source("_common.R")
+```
+
+
+## Why Replication Studies? {#sec-why-replication}
+
+You have read a methods paper. You followed the notation through the proofs, traced the logic of the simulation design, and nodded along at the results. You understand it --- or at least, you think you do.
+
+Then someone asks you to *build* the simulation from scratch. Suddenly, every glossed-over detail demands a concrete decision. How exactly do you sample the design matrices? What happens when the optimizer does not converge? How do you store 4,000 replications across 72 conditions without your code becoming unmanageable?
+
+This is the gap between reading methodology and *doing* methodology. And the most reliable way to close that gap is replication.
+
+In laboratory sciences, replication is how students learn technique. A chemistry student does not invent a new synthesis for their first experiment --- they replicate a known reaction and compare their yield to the published result. If it matches, they know their technique is sound. If it does not, they learn to debug. The same logic applies to simulation methodology. When you replicate @pustejovsky2022 and your RMSE table matches theirs within Monte Carlo error, you know your data-generating process, estimation pipeline, and performance evaluation code are all correct. When a number does *not* match, the debugging process teaches you more than the match ever would.
+
+::: {.callout-tip}
+## The pedagogical thesis of this course
+The best way to understand a simulation study is to build one. Not to read about one, not to review one --- to build one, from the data-generating process through the final performance table, and then to verify your results against the published originals.
+:::
+
+This is the second mini course in the SimSum series. The [first course](https://joonho112.github.io/simsum-mini-course/) established the theoretical toolkit --- performance metrics like bias and coverage, Monte Carlo standard errors (MCSEs), the ADEMP framework [@morris2019], and visualization techniques for simulation results. That course focused on **rsimsum** and the *analysis* of simulation output. This course shifts the emphasis to *building* a simulation from end to end, using **simhelpers** [@simhelpers] as the primary infrastructure and **rsimsum** [@gasparini2018] as a secondary tool shown via Quarto tabsets.
+
+A note on what "replication" means here: we are not re-running the original code verbatim. We are *reimplementing* the simulation using a structured framework, comparing our results to the originals, and learning from both the matches and the discrepancies. This is a pedagogical replication --- the goal is understanding, not merely reproduction.
+
+
+## The Methodological Challenge: Dependent Effect Sizes {#sec-dependent-effects}
+
+To appreciate what @pustejovsky2022 contribute, we need to understand the problem they are solving.
+
+Meta-analysis synthesizes findings across studies. In the textbook case, each study contributes exactly one effect size, and the effect sizes are independent. The statistical machinery for this scenario --- random-effects models, forest plots, $I^2$ statistics --- is well-established and implemented in packages like **metafor** [@viechtbauer2010].
+
+But the textbook case is often a fiction. Consider the landscape of applied research:
+
+- **Prevention science.** A study of a brief alcohol intervention reports effect sizes for frequency of use, quantity of use, peak consumption, and blood alcohol concentration --- all measured on the same participants.
+- **Education research.** A study evaluating a reading program reports outcomes for vocabulary, comprehension, and fluency.
+- **Clinical psychology.** A treatment study assesses depression, anxiety, and functional impairment at three follow-up time points.
+
+In each scenario, a single study produces multiple, correlated effect sizes. The @tannersmiths2015 meta-analysis that motivates @pustejovsky2022 is a concrete example: 117 studies contributed 1,198 effect sizes, an average of roughly 10 per study.
+
+This dependence creates a genuine statistical problem. Ignoring it and treating all effect sizes as independent produces standard errors that are too small and confidence intervals that are too narrow. Handling it by selecting one effect size per study throws away information and may introduce selection bias. Averaging within studies is slightly better, but still discards information about within-study variation.
+
+### Two competing strategies
+
+Two broad approaches have emerged:
+
+1. **Robust variance estimation (RVE)**, introduced by @hedges2010, uses a sandwich-type estimator that produces valid standard errors *regardless* of the true within-study correlation structure. The appeal is that you do not need to know or correctly specify the dependence. The cost is that RVE can be inefficient --- it ignores whatever information is available about the dependence structure --- and it requires small-sample corrections [@tipton2015; @tiptonpustejovsky2015] to perform well when the number of studies is modest.
+
+2. **Multivariate meta-analysis**, which explicitly models the correlation structure among effect sizes within studies. This is more efficient when correctly specified, but requires assumptions about within-study covariances that are rarely known in practice.
+
+::: {.callout-note}
+## Why this matters for your research
+If you are conducting a meta-analysis in prevention science, education, or psychology, you almost certainly have dependent effect sizes. The choice of how to handle that dependence affects the precision of your estimates, the power of your hypothesis tests, and the variance components you can report. This is not an esoteric methodological detail --- it is a decision that shapes the substantive conclusions of your review.
+:::
+
+
+## What Pustejovsky and Tipton (2022) Contribute {#sec-pt2022-contribution}
+
+@pustejovsky2022 bridge the gap between these two strategies. The key insight is that you can use a multivariate working model to obtain more efficient weights, and then apply RVE on top to protect against misspecification. You get the efficiency gains of modeling the dependence *and* the robustness of the sandwich estimator.
+
+### Four working models
+
+The paper develops a family of working models, each making progressively richer assumptions about the random effects structure:
+
+| Model | Abbreviation | Key Feature |
+|:------|:-------------|:------------|
+| Hierarchical Effects | HE | Effect sizes within a study are conditionally independent |
+| Correlated Effects | CE | Within-study effect sizes share a common random effect (equi-correlated) |
+| Correlated-and-Hierarchical Effects | CHE | CE structure plus effect-specific random effects (within-study heterogeneity) |
+| Subgroup Correlated Effects | SCE | Category-specific between-study variances within a CE structure |
+
+The CE model is the original @hedges2010 specification, implemented in **robumeta** [@fisher2017]. The CHE and SCE models are the new contributions, implemented via **metafor** [@viechtbauer2010] with robust inference from **clubSandwich** [@pustejovsky2020].
+
+A fifth model --- the *Correlated Multivariate Effects* (CMVE) model, with fully category-specific variance components and cross-category correlations --- appears as one of the data-generating processes in the simulation but is not recommended as a practical working model due to its heavy estimation demands.
+
+### The decision tree
+
+Rather than leaving researchers to choose a model by intuition, the paper provides a practical decision tree (their Figure 1) organized around two questions:
+
+1. Is within-study heterogeneity in true effects plausible?
+2. Does the focal predictor vary within studies, between studies, or both?
+
+The answers map directly to model recommendations. For instance, if within-study heterogeneity is plausible and the focal predictor varies within studies, CHE is the recommended working model. This kind of practical guidance is what makes the paper immediately useful for applied researchers.
+
+### The hybrid approach
+
+The core innovation is *combining* multivariate/multilevel working models with cluster-robust variance estimation:
+
+1. **Fit the working model** (e.g., CHE) via REML, obtaining variance component estimates and fully inverse-variance weights.
+2. **Apply CR2 corrections** via **clubSandwich**, producing robust standard errors and Satterthwaite degrees of freedom.
+3. **Construct confidence intervals** that are valid even if the working model is misspecified.
+
+This hybrid approach preserves the efficiency gains of the working model --- the weights incorporate information about the dependence structure --- while the RVE layer provides insurance against getting that structure wrong.
+
+### The simulation evaluation
+
+The paper evaluates these working models through a simulation study calibrated to the @tannersmiths2015 dataset. The simulation crosses six design factors:
+
+- 2 sample sizes (J = 30 or 60 studies)
+- 3 DGP structures (CE, CHE, CMVE)
+- 3 levels of between-study heterogeneity ($\tau$ = 0.05, 0.10, 0.20)
+- 2 levels of within-study heterogeneity ($\omega$ = 0.00, 0.10)
+- 4 levels of average within-study correlation ($\bar\rho$ = 0.2, 0.4, 0.6, 0.8)
+
+After filtering for non-redundant conditions, this yields 72 unique scenarios, each evaluated over R = 4,012 replications. The headline finding: CHE provides 10--50% reductions in RMSE for within-study predictors compared to the standard CE model, while maintaining approximately nominal coverage.
+
+::: {.callout-tip}
+## The one-sentence summary
+You can make meta-analysis with dependent effect sizes both more efficient *and* robust by combining a structured working model (CHE or SCE) with robust variance estimation, rather than relying on RVE alone.
+:::
+
+
+## The Open Science Dimension {#sec-open-science}
+
+One of the reasons @pustejovsky2022 is ideal for a pedagogical replication is that the authors practiced exemplary open science. All simulation materials are publicly available on the Open Science Framework [@pustejovsky2022osf] at <https://osf.io/x8yre/>.
+
+### File inventory
+
+@tbl-osf-files provides a concrete inventory of what the repository contains and what each file does.
+
+| File | Purpose |
+|:-----|:--------|
+| `RVE functions.R` | Core simulation functions: `generate_smd()`, `generate_meta()`, `estimate_robu()`, `estimate_CHE()`, `estimate_MV()`, `estimate_models()`, `generate_estimate()` |
+| `dv-model-data.Rdata` | Pre-processed TSL15 data, fitted model objects, and calibrated parameters for the `dvcat` (type of dependent variable) specification |
+| `Ctype-model-data.Rdata` | Same for the `Ctype` (type of control group) specification |
+| `RVE-simulation-dvcat.R` | Driver script for the `dvcat` simulation: defines design factors, creates the condition grid, runs the factorial experiment in batches |
+| `RVE-simulation-Ctype.R` | Parallel driver script for the `Ctype` specification |
+| `RVE-simulation-results-dvcat.R` | Post-processing: loads raw results, computes performance metrics, generates figures and tables |
+| `RVE-simulation-results-Ctype.R` | Same for `Ctype` |
+| `Simulation results/` | Directory of `.Rdata` files with raw simulation output (4,012 replications per condition) |
+
+: File inventory for the @pustejovsky2022 OSF repository (<https://osf.io/x8yre/>). {#tbl-osf-files}
+
+### Why this enables our replication
+
+This level of transparency is not just good practice --- it is what makes our course possible. Specifically:
+
+- **`RVE functions.R`** lets us examine every function, trace every parameter choice, and verify our reimplementations line by line.
+- **`dv-model-data.Rdata`** gives us the exact empirical parameters (regression coefficients, variance components, sample sizes) used to calibrate the simulation, so our DGP operates in the same parameter space.
+- **The raw results files** provide the benchmark against which we verify our replication. If our coverage rates differ from theirs by more than MCSE would predict, we know something is wrong.
+- **The driver scripts** reveal the batching structure, seed management, and condition filtering that are often undocumented in methods papers.
+
+::: {.callout-note}
+## What makes this an Open Science exemplar
+Not all "open" simulation studies are equally useful for learning. @pustejovsky2022 stands out because the code is **modular** (each function does one thing), **calibrated to real data** (not arbitrary parameter choices), and **complete** (every step from data generation to final table is scripted). These features separate code that happens to be public from code that is genuinely useful for others.
+:::
+
+
+## The DSR Framework {#sec-dsr-framework}
+
+To give our replication a coherent structure, we follow the framework from *Designing Monte Carlo Simulations in R* [@miratrixpustejovsky2024], an online textbook by Luke Miratrix and James Pustejovsky. The DSR framework organizes the simulation workflow into a sequence of well-defined steps:
+
+1. **Specify the data-generating process.** Define the probability model from which synthetic data will be drawn, including all parameters and their ranges.
+2. **Write the DGP function.** Implement a function that takes parameters as inputs and returns one simulated dataset.
+3. **Write the estimation function.** Implement a function that takes one dataset and returns the quantities of interest (point estimates, standard errors, confidence intervals).
+4. **Write the performance function.** Implement a function that takes simulation results across replications and computes performance metrics.
+5. **Define the experimental design.** Specify the factorial structure: which parameters vary, over what levels, and how they are crossed.
+6. **Execute the simulation.** Run the DGP-estimation-performance pipeline across all conditions and replications.
+7. **Analyze and report results.** Summarize performance, create visualizations, and draw conclusions.
+
+The DSR framework aligns naturally with the ADEMP framework [@morris2019] covered in Mini Course 1, but adds concrete implementation guidance. Where ADEMP asks "what are your data-generating mechanisms?", DSR asks "what does your `generate_data()` function look like?" Where ADEMP asks "what are your performance measures?", DSR asks "what does your `calc_performance()` function return?"
+
+The **simhelpers** package [@simhelpers] is the computational companion to the DSR textbook. It provides functions for bundling simulation iterations (`bundle_sim()`), computing performance metrics with MCSEs (`calc_absolute()`, `calc_relative()`, `calc_coverage()`), and managing the simulation workflow. We use `simhelpers` as our primary tool throughout this course, with **rsimsum** shown as an alternative via Quarto tabsets for readers who prefer that ecosystem.
+
+@tbl-dsr-ademp shows how the DSR steps map onto the ADEMP components and the chapters of this book.
+
+| DSR Step | ADEMP Component | Course Chapter |
+|:---------|:----------------|:---------------|
+| Specify the DGP | **D**ata-generating mechanisms | Ch 4--6 |
+| Write the DGP function | **D**ata-generating mechanisms | Ch 5--6 |
+| Write the estimation function | **M**ethods | Ch 7 |
+| Write the performance function | **P**erformance measures | Ch 8, 11 |
+| Define the experimental design | **A**ims + **D**ata-generating mechanisms | Ch 2, 9 |
+| Execute the simulation | (Execution) | Ch 10 |
+| Analyze and report | **P**erformance measures | Ch 11--14 |
+
+: Mapping DSR steps to ADEMP components and course chapters. {#tbl-dsr-ademp}
+
+
+## Course Roadmap {#sec-roadmap}
+
+@tbl-roadmap gives the complete chapter plan. The book follows the lifecycle of the @pustejovsky2022 simulation, from context through final reporting.
+
+| Chapter | Title | What You Will Learn |
+|:-------:|:------|:--------------------|
+| 1 | Introduction: Learning by Replication | Why replication; what P&T (2022) contributes; course overview |
+| 2 | The ADEMP Blueprint | Full ADEMP decomposition of the simulation; mapping to DSR steps |
+| 3 | The Empirical Foundation: TSL15 | Exploring the real meta-analytic dataset; understanding real-data calibration |
+| 4 | Meta-Analytic Working Models | HE, CE, CHE, SCE model specifications; variance structures; the decision tree |
+| 5 | Generating Effect Sizes | The `generate_smd()` function; Wishart sampling; Hedges' g correction |
+| 6 | Generating Meta-Analytic Datasets | The `generate_meta()` function; study resampling; three DGPs |
+| 7 | Implementing Estimation | CE via `robumeta`, CHE/SCE via `metafor` + `clubSandwich`; convergence handling |
+| 8 | From Iteration to Pipeline | The `generate_estimate()` driver; bundling with `simhelpers` |
+| 9 | The Factorial Design | Design factors; crossing and filtering; 72 conditions; MCSE-driven replication counts |
+| 10 | Running the Simulation | Parallel execution; batch structure; seed management |
+| 11 | Performance Metrics | Bias, RMSE, coverage, CI width via `simhelpers` and `rsimsum` |
+| 12 | Verifying the Replication | Systematic comparison to published results; diagnosing discrepancies |
+| 13 | Visualizing Results | Lolly plots, heat maps, RMSE ratio plots; recreating the paper's figures |
+| 14 | Reporting | ADEMP checklist; writing up a simulation study; lessons learned |
+
+: Course roadmap: chapters and learning objectives. {#tbl-roadmap}
+
+Three appendices supplement the main text: **Appendix A** replicates the real-data analysis (P&T's Tables 1--2), **Appendix B** provides full mathematical derivations of the variance-covariance matrices, and **Appendix C** gives a complete `simhelpers` vs. `rsimsum` function reference.
+
+
+## Data files {#sec-data-files}
+
+This course relies on data files from the [Open Science Framework repository](https://osf.io/x8yre/) for @pustejovsky2022. The files include the TSL15 empirical dataset, the calibrated model parameters, and the pre-computed simulation results.
+
+To verify that all required files are in place, run:
+
+```r
+source("R/download-data.R")
+```
+
+If any files are missing, download them from the OSF repository and place them in the `data/` directory. A complete listing appears in @tbl-osf-files.
+
+::: {.callout-important}
+## External data dependency
+The data files are not distributed with the book source to respect the original authors' data management choices. You must download them separately from OSF. The `R/download-data.R` script checks for their presence and reports any missing files.
+:::
+
+
+## Software Setup {#sec-software-setup}
+
+All code in this course runs in R. Install the following packages before proceeding to @sec-ademp-blueprint.
+
+```{r}
+#| label: install-packages
+#| eval: false
+
+# --- Simulation infrastructure ---
+install.packages("simhelpers")    # Primary: DSR companion for simulation workflow
+install.packages("rsimsum")       # Secondary: simulation summaries, MCSEs, autoplot
+
+# --- Meta-analysis estimation ---
+install.packages("metafor")       # Multivariate/multilevel meta-analysis (CHE, SCE)
+install.packages("clubSandwich")  # CR2 cluster-robust variance estimation
+install.packages("robumeta")      # Original CE working model (Hedges et al., 2010)
+
+# --- Data manipulation and visualization ---
+install.packages("tidyverse")     # dplyr, ggplot2, tidyr, purrr, etc.
+```
+
+Verify that everything loads without errors:
+
+```{r}
+#| label: verify-packages
+#| eval: false
+
+library(simhelpers)
+library(rsimsum)
+library(metafor)
+library(clubSandwich)
+library(robumeta)
+library(tidyverse)
+
+cat("All packages loaded successfully.\n")
+```
+
+::: {.callout-note}
+## Package roles at a glance
+**simhelpers** and **rsimsum** are tools for *running and analyzing simulations* --- they help you manage replications, compute performance metrics, and report results. **metafor**, **clubSandwich**, and **robumeta** are the *subject-matter packages* --- the estimation methods that @pustejovsky2022 evaluate in their simulation. You need both layers: the simulation infrastructure and the methods being simulated.
+:::
+
+The current package versions used in developing this course:
+
+```{r}
+#| label: tbl-session-info
+#| tbl-cap: "Package versions used in developing this course."
+pkgs <- c("simhelpers", "rsimsum", "metafor",
+           "clubSandwich", "robumeta")
+
+pkg_versions <- sapply(pkgs, function(p) as.character(packageVersion(p)))
+data.frame(
+  Package = pkgs,
+  Version = pkg_versions,
+  row.names = NULL
+) |> knitr::kable()
+```
+
+If you encounter minor numerical discrepancies in later chapters, package version differences are the first thing to check. We will flag specific version sensitivities as they arise.
+
+
+## What Comes Next
+
+With the motivation, the paper, and the tools in place, we are ready to begin the actual work. In @sec-ademp-blueprint, we perform a full ADEMP decomposition of the @pustejovsky2022 simulation --- mapping out the Aims, Data-generating mechanisms, Estimands, Methods, and Performance criteria before writing a single line of simulation code. This planning step is where good simulation studies begin.
